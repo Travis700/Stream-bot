@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from shared.config import settings
-from shared.media import run
+from shared.media import probe, run
 from shared.transcribe import Word
 
 from .facecam import Box, SceneLayout
@@ -86,8 +86,9 @@ def plan_layout(scene: SceneLayout, requested: str = "auto") -> RenderPlan:
         gx = game_crop_x(src_w, gw, cam)
         gy = _even((src_h - gh) / 2)
         graph = (
-            f"[0:v]crop={cam_crop.w}:{cam_crop.h}:{cam_crop.x}:{cam_crop.y},scale={OUT_W}:{top_h},setsar=1[cam];"
-            f"[0:v]crop={gw}:{gh}:{gx}:{gy},scale={OUT_W}:{bottom_h},setsar=1[game];"
+            f"[src]split=2[s1][s2];"
+            f"[s1]crop={cam_crop.w}:{cam_crop.h}:{cam_crop.x}:{cam_crop.y},scale={OUT_W}:{top_h},setsar=1[cam];"
+            f"[s2]crop={gw}:{gh}:{gx}:{gy},scale={OUT_W}:{bottom_h},setsar=1[game];"
             f"[cam][game]vstack=inputs=2[stack]"
         )
         return RenderPlan("split", graph, caption_y=top_h)
@@ -97,7 +98,7 @@ def plan_layout(scene: SceneLayout, requested: str = "auto") -> RenderPlan:
         assert face is not None
         cw, ch = fit_crop(src_w, src_h, OUT_W / OUT_H)
         cx = _even(min(max(face.cx - cw / 2, 0), src_w - cw))
-        graph = f"[0:v]crop={cw}:{ch}:{cx}:0,scale={OUT_W}:{OUT_H},setsar=1[stack]"
+        graph = f"[src]crop={cw}:{ch}:{cx}:0,scale={OUT_W}:{OUT_H},setsar=1[stack]"
         return RenderPlan("fullcam", graph, caption_y=int(OUT_H * 0.72))
 
     # fit: zoomed 4:3 centre of the stream over a blurred, darkened copy of itself.
@@ -106,7 +107,7 @@ def plan_layout(scene: SceneLayout, requested: str = "auto") -> RenderPlan:
     fg_h = _even(OUT_W * 3 / 4)
     fg_y = _even((OUT_H - fg_h) / 2)
     graph = (
-        f"[0:v]split=2[a][b];"
+        f"[src]split=2[a][b];"
         f"[a]scale=-2:{OUT_H},crop={OUT_W}:{OUT_H},boxblur=24:2,eq=brightness=-0.12,setsar=1[bg];"
         f"[b]crop={fw}:{fh}:{fx}:{fy},scale={OUT_W}:{fg_h},setsar=1[fg];"
         f"[bg][fg]overlay=0:{fg_y}[stack]"
@@ -118,11 +119,36 @@ def _filter_path(path: Path) -> str:
     return str(path).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
 
 
+def source_graph(keep: list[tuple[float, float]], has_audio: bool) -> str:
+    """Filters that cut the kept pieces out of input 0 and join them into [src] (and [asrc])."""
+    if len(keep) == 1:
+        s, e = keep[0]
+        graph = f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS[src]"
+        if has_audio:
+            graph += f";[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[asrc]"
+        return graph
+    parts, inputs = [], ""
+    for i, (s, e) in enumerate(keep):
+        parts.append(f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS[v{i}]")
+        inputs += f"[v{i}]"
+        if has_audio:
+            parts.append(f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[a{i}]")
+            inputs += f"[a{i}]"
+    outputs = "[src][asrc]" if has_audio else "[src]"
+    parts.append(f"{inputs}concat=n={len(keep)}:v=1:a={int(has_audio)}{outputs}")
+    return ";".join(parts)
+
+
 def render(source: Path, out: Path, scene: SceneLayout, words: list[Word], duration: float,
-           layout: str = "auto", subtitles: bool = True) -> str:
-    """Render the vertical clip. Returns the layout actually used."""
+           layout: str = "auto", subtitles: bool = True, keep: list[tuple[float, float]] | None = None) -> str:
+    """Render the vertical clip. Returns the layout actually used.
+
+    ``keep`` lists the pieces of ``source`` to keep (jump cuts); ``words`` and ``duration`` must
+    already describe the tightened timeline.
+    """
     plan = plan_layout(scene, layout)
-    graph = plan.filter_graph
+    has_audio = any(st.get("codec_type") == "audio" for st in probe(source)["streams"])
+    graph = source_graph(keep or [(0.0, duration)], has_audio) + ";" + plan.filter_graph
     last = "[stack]"
     if subtitles and words:
         ass = write_ass(out.with_suffix(".ass"), words, plan.caption_y, settings.subtitle_font, duration)
@@ -130,11 +156,14 @@ def render(source: Path, out: Path, scene: SceneLayout, words: list[Word], durat
         graph += f";[stack]ass=filename='{_filter_path(ass)}':fontsdir='{_filter_path(fonts)}'[subbed]"
         last = "[subbed]"
     graph += f";{last}fps={settings.render_fps},format=yuv420p[v]"
+    audio_args: list[str] = []
+    if has_audio:
+        graph += ";[asrc]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]"
+        audio_args = ["-map", "[aout]", "-c:a", "aac", "-b:a", "160k"]
     run([
-        "ffmpeg", "-v", "error", "-y", "-i", str(source), "-t", f"{duration:.2f}",
-        "-filter_complex", graph, "-map", "[v]", "-map", "0:a:0?",
+        "ffmpeg", "-v", "error", "-y", "-i", str(source),
+        "-filter_complex", graph, "-map", "[v]", *audio_args,
         "-c:v", "libx264", "-preset", settings.render_preset, "-crf", "20", "-profile:v", "high",
-        "-af", "loudnorm=I=-14:TP=-1.5:LRA=11", "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
         "-movflags", "+faststart", str(out),
     ])
     return plan.layout

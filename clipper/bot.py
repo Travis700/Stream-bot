@@ -123,13 +123,15 @@ class ClipperBot(discord.Client):
                 job["status_message_id"] = msg.id
                 self.db.update_job(job["id"], status_message_id=msg.id)
         try:
+            started = time.monotonic()
             clip_ids = await pipeline.process_vod(self.db, job, lambda t: self.set_job_status(job, t))
+            took = pipeline._fmt_len(time.monotonic() - started)
             for clip_id in clip_ids:
                 await self.post_clip(clip_id)
             self.db.update_job(job["id"], status="done")
             if job["payload"].get("vod_row_id"):
                 self.db.execute("UPDATE vods SET status='done' WHERE id=?", (job["payload"]["vod_row_id"],))
-            await self.set_job_status(job, f"✅ done — {len(clip_ids)} clip(s) posted.", force=True)
+            await self.set_job_status(job, f"✅ done in {took} — {len(clip_ids)} clip(s) posted.", force=True)
         except Exception as exc:  # noqa: BLE001
             log.error("Job %s failed: %s", job["id"], traceback.format_exc())
             message = str(exc) if isinstance(exc, pipeline.JobError) else f"{type(exc).__name__}: {exc}"
@@ -158,7 +160,7 @@ class ClipperBot(discord.Client):
         limit = guild.filesize_limit if guild else 10 * 1024 * 1024
         attachment_path = await asyncio.to_thread(pipeline.make_preview_for, self.db, clip, limit - 200_000)
 
-        length = clip["end_s"] - clip["start_s"]
+        length = clip.get("duration") or (clip["end_s"] - clip["start_s"])
         platform = streamer.get("platform", "")
         embed = discord.Embed(title=clip["title"][:256], description=(clip["reason"] or "")[:1500],
                               color=discord.Color.purple())
@@ -401,7 +403,7 @@ def register_commands(bot: ClipperBot) -> None:
                                     default_permissions=discord.Permissions(manage_guild=True))
 
     async def enqueue_vod(interaction: discord.Interaction, streamer: dict, url: str, count: int | None,
-                          layout: str, subtitles: bool) -> None:
+                          layout: str, subtitles: bool, cut_dead_air: bool) -> None:
         if streamer["permission"] != "allowed":
             await interaction.followup.send(
                 f"Not clipping **{streamer['channel']}** — clipping status is **{streamer['permission']}**.",
@@ -409,7 +411,7 @@ def register_commands(bot: ClipperBot) -> None:
             return
         job_id = db.enqueue_job(interaction.guild_id, "vod",
                                 {"url": url, "streamer_id": streamer["id"], "count": count, "layout": layout,
-                                 "subtitles": subtitles},
+                                 "subtitles": subtitles, "tighten": cut_dead_air},
                                 requested_by=interaction.user.id, status_channel_id=interaction.channel_id)
         ahead = db.one("SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','running') AND id < ?", (job_id,))
         await interaction.followup.send(f"Queued job **#{job_id}** for {url} "
@@ -418,9 +420,11 @@ def register_commands(bot: ClipperBot) -> None:
     @clip_group.command(name="vod", description="Clip a specific VOD (Twitch, Kick or YouTube URL)")
     @app_commands.choices(layout=LAYOUT_CHOICES)
     @app_commands.describe(count="How many clips to make", layout="auto = detect facecam",
-                           subtitles="Burn in captions")
+                           subtitles="Burn in captions",
+                           cut_dead_air="Jump-cut pauses where nothing is said or happening")
     async def clip_vod(interaction: discord.Interaction, url: str, count: app_commands.Range[int, 1, 10] | None = None,
-                       layout: app_commands.Choice[str] | None = None, subtitles: bool = True) -> None:
+                       layout: app_commands.Choice[str] | None = None, subtitles: bool = True,
+                       cut_dead_air: bool = True) -> None:
         await interaction.response.defer(thinking=True)
         platform = platforms.detect_platform(url)
         if platform not in platforms.PLATFORMS:
@@ -445,14 +449,16 @@ def register_commands(bot: ClipperBot) -> None:
                  result.evidence, time.time(), time.time()),
             )
             streamer = db.one("SELECT * FROM streamers WHERE id=?", (sid,))
-        await enqueue_vod(interaction, streamer, url, count, layout.value if layout else "auto", subtitles)
+        await enqueue_vod(interaction, streamer, url, count, layout.value if layout else "auto", subtitles,
+                          cut_dead_air)
 
     @clip_group.command(name="latest", description="Clip a tracked streamer's most recent finished VOD")
     @app_commands.autocomplete(streamer=streamer_autocomplete)
     @app_commands.choices(layout=LAYOUT_CHOICES)
     async def clip_latest(interaction: discord.Interaction, streamer: str,
                           count: app_commands.Range[int, 1, 10] | None = None,
-                          layout: app_commands.Choice[str] | None = None, subtitles: bool = True) -> None:
+                          layout: app_commands.Choice[str] | None = None, subtitles: bool = True,
+                       cut_dead_air: bool = True) -> None:
         await interaction.response.defer(thinking=True)
         s = db.find_streamer(interaction.guild_id, streamer)
         if not s:
@@ -463,7 +469,8 @@ def register_commands(bot: ClipperBot) -> None:
         if not vods:
             await interaction.followup.send("No finished VODs found.")
             return
-        await enqueue_vod(interaction, s, vods[0]["url"], count, layout.value if layout else "auto", subtitles)
+        await enqueue_vod(interaction, s, vods[0]["url"], count, layout.value if layout else "auto", subtitles,
+                          cut_dead_air)
 
     @clip_group.command(name="jobs", description="Show the clip job queue")
     async def clip_jobs(interaction: discord.Interaction) -> None:

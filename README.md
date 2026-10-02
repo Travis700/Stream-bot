@@ -4,27 +4,30 @@ Two Discord bots that run on a cloud server (built for Oracle Cloud's free ARM V
 
 | Bot | What it does |
 |---|---|
-| **Clipper** | Watches streamers' Twitch / Kick / YouTube VODs, finds the best moments, and cuts them into 2–2.5 minute **vertical (9:16)** clips. It moves the facecam so it doesn't cover the game and burns in TikTok-style captions. It posts the clips to your clips channel, checks whether each streamer allows clipping, and collects new posts from the streamers' own clipper accounts. |
+| **Clipper** | Watches streamers' Twitch / Kick / YouTube VODs, finds the best moments, and cuts them into 1–2 minute **vertical (9:16)** clips. It moves the facecam so it doesn't cover the game and burns in TikTok-style captions. It posts the clips to your clips channel, checks whether each streamer allows clipping, and collects new posts from the streamers' own clipper accounts. |
 | **Rater** | Watches the clips channel and rates every clip **1–10** for how well it will do on TikTok / Reels / Shorts. It learns from high-view clips of streamers on TikTok and Instagram, and from the real view counts you report back. |
 
 ## How it works
 
 ```
-VOD ──► download audio only ──► loudness "hype" curve ──► top moments
+VOD ──► download audio only ──► loudness "hype" curve ──┐
+    └─► chat replay (Twitch/YouTube) ──► chat-spike curve ─┴─► top moments
                                                             │ transcribe only those (CPU Whisper)
                                                             ▼
-                                    the AI picks and trims the best 2–2.5 min clips
+                                    the AI picks and trims the best 1–2 min clips
                                                             │
      download just those minutes of video ◄─────────────────┘
         │
         ▼
- find facecam (OpenCV) ──► 1080×1920 layout ──► burn captions ──► post to #clips
+ cut dead air ──► find facecam (OpenCV) ──► 1080×1920 layout ──► burn captions ──► post to #clips
                                                                       │
                                        Rater bot ◄────────────────────┘
           frames + transcript + learned viral examples ──► AI ──► 1–10 rating, fixes, caption
 ```
 
 * **CPU only.** Speech-to-text uses `faster-whisper` (int8 on CPU), face detection uses OpenCV, and video uses ffmpeg/x264. Only the hype moments get transcribed, so a 6-hour VOD doesn't need 6 hours of transcription.
+* **Chat as a signal.** On Twitch and YouTube the bot reads the VOD's chat replay. Chat suddenly spamming "KEKW", "LMAO", "💀" or "CLIP IT" marks a moment even when the streamer stays quiet. Chat counts alongside loudness, and the AI also sees what chat spammed for each moment. Kick has no usable chat replay, so Kick VODs use audio only.
+* **1–2 minute clips with no slow middle.** The AI is told to keep clips tight and use the shortest length that has both the setup and the payoff. Then pauses of 1.5s or more, where nobody is talking *and* the audio is quiet, are jump-cut out. Loud game moments are never cut, and a clip is never trimmed below 1 minute, since TikTok only pays for videos over 1 minute. Turn this off with `cut_dead_air:False` on `/clip` or `CUT_DEAD_AIR=0`.
 * **Facecam handling.** The bot samples frames and finds a face that stays in the same spot, which is the webcam overlay. It then snaps to the overlay's border.
   * `split` layout (gaming): facecam on top, gameplay below. The gameplay crop is moved away from the webcam if the webcam would cover it.
   * `fullcam` layout (Just Chatting / IRL): a 9:16 crop that follows the face.
@@ -43,7 +46,7 @@ VOD ──► download audio only ──► loudness "hype" curve ──► top 
 | `/streamer add platform channel [auto_clip]` | Track a streamer and run the clipping-permission check. New VODs are clipped automatically if allowed. |
 | `/streamer list` · `remove` · `recheck` · `autoclip` | Manage tracked streamers. |
 | `/streamer permission name allowed\|denied\|unknown [note]` | Your manual decision overrides the auto check. |
-| `/clip vod url [count] [layout] [subtitles]` | Clip a specific VOD. |
+| `/clip vod url [count] [layout] [subtitles] [cut_dead_air]` | Clip a specific VOD. |
 | `/clip latest streamer` | Clip the newest finished VOD. |
 | `/clip jobs` · `/clip cancel id` | Show the queue / cancel a queued job. |
 | `/clippers add url [streamer] [learn]` | Watch a streamer's own clipper (TikTok/YouTube/Instagram profile). New posts go to the feed channel. With `learn`, the rater also learns from that account's big clips. |

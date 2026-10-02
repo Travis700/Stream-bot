@@ -42,8 +42,10 @@ class Settings:
     whisper_model: str = field(default_factory=lambda: os.getenv("WHISPER_MODEL", "small"))
     whisper_threads: int = field(default_factory=lambda: _int("WHISPER_THREADS", os.cpu_count() or 4))
 
-    clip_min_seconds: int = field(default_factory=lambda: _int("CLIP_MIN_SECONDS", 120))
-    clip_max_seconds: int = field(default_factory=lambda: _int("CLIP_MAX_SECONDS", 150))
+    clip_min_seconds: int = field(default_factory=lambda: _int("CLIP_MIN_SECONDS", 60))
+    clip_max_seconds: int = field(default_factory=lambda: _int("CLIP_MAX_SECONDS", 120))
+    # Jump-cut pauses where nobody talks and the audio is quiet.
+    cut_dead_air: bool = field(default_factory=lambda: os.getenv("CUT_DEAD_AIR", "1").strip() not in ("0", "false", "no"))
     clips_per_vod: int = field(default_factory=lambda: _int("CLIPS_PER_VOD", 4))
     clip_retention_days: int = field(default_factory=lambda: _int("CLIP_RETENTION_DAYS", 7))
     render_fps: int = field(default_factory=lambda: _int("RENDER_FPS", 30))

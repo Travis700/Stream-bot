@@ -1,11 +1,12 @@
-"""Find the best 2–2.5 minute moments in a long VOD, using CPU only.
+"""Find the best 1–2 minute moments in a long VOD, using CPU only.
 
 1. Loudness per second for the whole VOD -> an "excitement" curve (yelling, laughing,
    hype moments stand out from the streamer's normal talking level).
-2. The loudest non-overlapping windows become candidates.
-3. Only the candidates are transcribed (transcribing a full 6h VOD on CPU is slow).
-4. Claude reads the candidate transcripts and picks/trims the best clips. Without an API
-   key a heuristic (excitement + how much is being said) picks instead.
+2. Chat replay (Twitch/YouTube) -> a second curve: chat spamming "LMAO"/"CLIP IT" marks a moment.
+3. The highest-scoring non-overlapping windows become candidates.
+4. Only the candidates are transcribed (transcribing a full 6h VOD on CPU is slow).
+5. The AI reads the candidate transcripts + chat reaction and picks/trims the best clips.
+   Without AI a heuristic (excitement + how much is being said) picks instead.
 """
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ class Candidate:
     end: float
     score: float
     words: list[Word] = field(default_factory=list)  # timestamps relative to ``start``
+    chat: str = ""        # summary of chat's reaction, if chat replay was available
 
 
 @dataclass
@@ -55,6 +57,23 @@ def excitement_curve(loudness: np.ndarray, baseline_seconds: int = 300, smooth_s
     excitement[loudness < -50] = 0
     kernel = np.ones(smooth_seconds) / smooth_seconds
     return np.convolve(excitement, kernel, mode="same")
+
+
+def combine_signals(audio: np.ndarray, chat: np.ndarray | None, chat_weight: float = 1.2) -> np.ndarray:
+    """Put audio and chat excitement on the same scale and add them."""
+    def norm(x: np.ndarray) -> np.ndarray:
+        # Scale by the typical size of the non-zero part, so rare spikes don't scale to zero.
+        active = x[x > 1e-6]
+        scale = float(np.percentile(active, 90)) if active.size else 0.0
+        return x / scale if scale > 1e-6 else np.zeros_like(x)
+
+    combined = norm(audio.astype(np.float32))
+    if chat is not None and chat.size:
+        c = np.zeros_like(combined)
+        n = min(len(c), len(chat))
+        c[:n] = chat[:n]
+        combined = combined + chat_weight * norm(c)
+    return combined
 
 
 def pick_windows(excitement: np.ndarray, count: int, window: int, skip_start: int = 120,
@@ -172,14 +191,19 @@ async def llm_plans(candidates: list[Candidate], count: int, min_len: int, max_l
         "seconds (a reaction, a bold claim, a question, chaos starting) and pay off before the end: funny moments, "
         "rage, clutch plays, drama, hot takes, wholesome chat interactions, storytimes with a punchline. Avoid "
         "moments that need prior context, dead air, reading long chat lists, ads/BRB screens, and anything that "
-        "only works visually if the transcript gives no hint. Start each clip on the beginning of a sentence and "
-        "end it right after the payoff."
+        "only works visually if the transcript gives no hint. Clips must be tight: every few seconds something "
+        "should happen or be said, with no slow middle stretch. Use the shortest length that keeps the setup and "
+        "the payoff; if a moment only works long, cut where it starts to drag rather than padding it. Start each "
+        "clip on the beginning of a sentence, ideally right on the hook, and end right after the payoff. When chat "
+        "reaction is given, a big spike means viewers loved that moment."
     )
     blocks = []
     for c in candidates:
         blocks.append(
             f"### Candidate {c.id}  (VOD {_hms(c.start)}–{_hms(c.end)}, length {c.end - c.start:.0f}s, "
-            f"audio excitement {c.score:.1f})\n{words_to_text(c.words) or '(no speech detected)'}"
+            f"excitement {c.score:.1f})\n"
+            + (f"Chat reaction: {c.chat}\n" if c.chat else "")
+            + (words_to_text(c.words) or "(no speech detected)")
         )
     prompt = (
         f"Streamer: {streamer}\nVOD title: {vod_title}\n\n"

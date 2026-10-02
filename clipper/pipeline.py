@@ -9,13 +9,13 @@ import time
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from shared import llm, media, platforms
+from shared import chat, llm, media, platforms
 from shared.config import settings
 from shared.db import Database, dumps
 from shared.patterns import learned_patterns_text
 from shared.transcribe import transcribe
 
-from . import facecam, highlights, render
+from . import facecam, highlights, render, tighten
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +32,7 @@ async def process_vod(db: Database, job: dict, progress: Progress) -> list[int]:
     count = int(p.get("count") or settings.clips_per_vod)
     layout = p.get("layout", "auto")
     subtitles = bool(p.get("subtitles", True))
+    tighten_cuts = bool(p.get("tighten", settings.cut_dead_air))
     streamer = db.one("SELECT * FROM streamers WHERE id=?", (p["streamer_id"],))
     if not streamer:
         raise JobError("Streamer was removed before the job ran.")
@@ -53,7 +54,16 @@ async def process_vod(db: Database, job: dict, progress: Progress) -> list[int]:
 
         await progress("Scanning audio for hype moments…")
         loud = await asyncio.to_thread(media.loudness_per_second, audio)
-        excitement = highlights.excitement_curve(loud)
+        audio_excitement = highlights.excitement_curve(loud)
+
+        messages = None
+        if streamer["platform"] in ("twitch", "youtube"):
+            await progress("Reading chat replay…")
+            messages = await chat.fetch_chat(streamer["platform"], url, info, work)
+        chat_curve = None
+        if messages:
+            chat_curve = chat.chat_excitement(chat.chat_activity(messages, len(loud)))
+        excitement = highlights.combine_signals(audio_excitement, chat_curve)
         window = settings.clip_max_seconds + 40
         # Fewer candidates for a local CPU model keeps the selection prompt (and wait) reasonable.
         max_candidates = min(count * 2, 8) if llm.is_local() else min(count * 3, 12)
@@ -65,7 +75,8 @@ async def process_vod(db: Database, job: dict, progress: Progress) -> list[int]:
         for i, (start, end, score) in enumerate(windows, 1):
             await progress(f"Transcribing candidate moment {i}/{len(windows)}…")
             words = await asyncio.to_thread(transcribe, audio, start, end - start)
-            candidates.append(highlights.Candidate(i, start, end, score, words))
+            reaction = chat.summarize(messages, start, end) if messages else ""
+            candidates.append(highlights.Candidate(i, start, end, score, words, reaction))
 
         await progress("Choosing the best clips…")
         plans: list[highlights.ClipPlan] = []
@@ -92,15 +103,22 @@ async def process_vod(db: Database, job: dict, progress: Progress) -> list[int]:
             scene = await asyncio.to_thread(facecam.analyse, src, detector)
             token = secrets.token_urlsafe(12)
             out = settings.clips_dir / f"{token}.mp4"
-            await progress(f"Clip {i}/{len(plans)}: rendering vertical video ({scene.kind})…")
-            used_layout = await asyncio.to_thread(render.render, src, out, scene, plan.words, length,
-                                                  layout, subtitles)
+            keep = [(0.0, length)]
+            if tighten_cuts:
+                keep = tighten.plan_keep_segments(plan.words, length, loud[int(plan.start): int(plan.end) + 1],
+                                                  min_total=min(settings.clip_min_seconds, length))
+            words = tighten.remap_words(plan.words, keep)
+            final_length = tighten.kept_duration(keep)
+            cut_note = f", cutting {length - final_length:.0f}s of dead air" if len(keep) > 1 else ""
+            await progress(f"Clip {i}/{len(plans)}: rendering vertical video ({scene.kind}{cut_note})…")
+            used_layout = await asyncio.to_thread(render.render, src, out, scene, words, final_length,
+                                                  layout, subtitles, keep)
             out.with_suffix(".ass").unlink(missing_ok=True)
             clip_id = db.execute(
-                "INSERT INTO clips (job_id, guild_id, streamer_id, vod_url, start_s, end_s, title, reason, layout, "
-                "transcript, file_path, token, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (job["id"], job["guild_id"], streamer["id"], url, plan.start, plan.end, plan.title, plan.reason,
-                 used_layout, dumps(plan.words), str(out), token, time.time()),
+                "INSERT INTO clips (job_id, guild_id, streamer_id, vod_url, start_s, end_s, duration, title, reason, "
+                "layout, transcript, file_path, token, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (job["id"], job["guild_id"], streamer["id"], url, plan.start, plan.end, final_length, plan.title,
+                 plan.reason, used_layout, dumps(words), str(out), token, time.time()),
             )
             clip_ids.append(clip_id)
         return clip_ids

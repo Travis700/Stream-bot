@@ -79,10 +79,10 @@ def test_snap_to_sentences():
 def test_heuristic_plans_respect_length():
     words = [{"w": f"w{i}", "s": i * 0.5, "e": i * 0.5 + 0.3} for i in range(380)]
     cands = [highlights.Candidate(1, 1000, 1190, 5.0, words), highlights.Candidate(2, 3000, 3190, 2.0, [])]
-    plans = highlights.heuristic_plans(cands, 2, 120, 150)
+    plans = highlights.heuristic_plans(cands, 2, 60, 120)
     assert len(plans) == 2
     for p in plans:
-        assert 120 <= p.end - p.start <= 150
+        assert 60 <= p.end - p.start <= 120
         assert all(w["s"] >= 0 for w in p.words)
 
 

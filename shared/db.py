@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS clips (
     vod_url TEXT,
     start_s REAL,
     end_s REAL,
+    duration REAL,            -- final length after dead-air cuts
     title TEXT,
     reason TEXT,
     layout TEXT,
@@ -129,12 +130,20 @@ CREATE TABLE IF NOT EXISTS reference_clips (
 """
 
 
+# Columns added after the first release: (table, column, type)
+MIGRATIONS = [("clips", "duration", "REAL")]
+
+
 class Database:
     def __init__(self, path: Path):
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            for table, column, kind in MIGRATIONS:
+                existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
