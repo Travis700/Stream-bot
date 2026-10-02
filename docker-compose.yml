@@ -1,0 +1,18 @@
+services:
+  clipper:
+    build: .
+    command: python -m clipper
+    env_file: .env
+    volumes:
+      - ./data:/data
+    ports:
+      - "${FILE_SERVER_PORT:-8080}:${FILE_SERVER_PORT:-8080}"
+    restart: unless-stopped
+
+  rater:
+    build: .
+    command: python -m rater
+    env_file: .env
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

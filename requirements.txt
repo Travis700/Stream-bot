@@ -1,0 +1,7 @@
+discord.py>=2.4,<3
+yt-dlp[default,curl-cffi]>=2026.8.19
+faster-whisper>=1.2
+opencv-python-headless>=4.10,<5
+numpy>=1.26
+anthropic>=1.11
+aiohttp>=3.9

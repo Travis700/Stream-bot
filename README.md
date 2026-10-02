@@ -1,0 +1,112 @@
+# Stream Bot
+
+Two Discord bots that run on a cloud server (built for Oracle Cloud's free ARM VM). Nothing runs on your PC and no GPU is needed. You control everything with slash commands in your Discord server.
+
+| Bot | What it does |
+|---|---|
+| **Clipper** | Watches streamers' Twitch / Kick / YouTube VODs, finds the best moments, and cuts them into 2–2.5 minute **vertical (9:16)** clips. It moves the facecam so it doesn't cover the game and burns in TikTok-style captions. It posts the clips to your clips channel, checks whether each streamer allows clipping, and collects new posts from the streamers' own clipper accounts. |
+| **Rater** | Watches the clips channel and rates every clip **1–10** for how well it will do on TikTok / Reels / Shorts. It learns from high-view clips of streamers on TikTok and Instagram, and from the real view counts you report back. |
+
+## How it works
+
+```
+VOD ──► download audio only ──► loudness "hype" curve ──► top moments
+                                                            │ transcribe only those (CPU Whisper)
+                                                            ▼
+                                       Claude picks and trims the best 2–2.5 min clips
+                                                            │
+     download just those minutes of video ◄─────────────────┘
+        │
+        ▼
+ find facecam (OpenCV) ──► 1080×1920 layout ──► burn captions ──► post to #clips
+                                                                      │
+                                       Rater bot ◄────────────────────┘
+          frames + transcript + learned viral examples ──► Claude ──► 1–10 rating, fixes, caption
+```
+
+* **CPU only.** Speech-to-text uses `faster-whisper` (int8 on CPU), face detection uses OpenCV, and video uses ffmpeg/x264. Only the hype moments get transcribed, so a 6-hour VOD doesn't need 6 hours of transcription.
+* **Facecam handling.** The bot samples frames and finds a face that stays in the same spot, which is the webcam overlay. It then snaps to the overlay's border.
+  * `split` layout (gaming): facecam on top, gameplay below. The gameplay crop is moved away from the webcam if the webcam would cover it.
+  * `fullcam` layout (Just Chatting / IRL): a 9:16 crop that follows the face.
+  * `fit` layout (no facecam found): zoomed gameplay over a blurred background.
+  * You can force any layout with `layout:` on `/clip`.
+* **Captions.** 1–3 words at a time, the current word highlighted in yellow, placed on the seam between cam and game.
+* **Clipping permission.** The bot reads the streamer's Twitch bio and panels, Kick bio, or YouTube channel description and looks for rules like *"no clipping"* or *"clips will be DMCA'd"* versus *"feel free to clip"* or *"clipping program"*. If the text is unclear, Claude reads it, but its answer is only used when it can quote the profile word for word. **Streamers marked `unknown` or `denied` are never clipped.** You approve them yourself with `/streamer permission`. Check their Discord rules and socials too, because many streamers only post clipping rules there.
+
+## Discord commands
+
+**Clipper bot** (admin-only; needs *Manage Server*)
+
+| Command | |
+|---|---|
+| `/setup clips_channel [clipper_feed_channel] [log_channel]` | Where things get posted. Run this first. |
+| `/streamer add platform channel [auto_clip]` | Track a streamer and run the clipping-permission check. New VODs are clipped automatically if allowed. |
+| `/streamer list` · `remove` · `recheck` · `autoclip` | Manage tracked streamers. |
+| `/streamer permission name allowed\|denied\|unknown [note]` | Your manual decision overrides the auto check. |
+| `/clip vod url [count] [layout] [subtitles]` | Clip a specific VOD. |
+| `/clip latest streamer` | Clip the newest finished VOD. |
+| `/clip jobs` · `/clip cancel id` | Show the queue / cancel a queued job. |
+| `/clippers add url [streamer] [learn]` | Watch a streamer's own clipper (TikTok/YouTube/Instagram profile). New posts go to the feed channel. With `learn`, the rater also learns from that account's big clips. |
+| `/clippers list` · `remove` · `check` | |
+
+**Rater bot**
+
+| Command | |
+|---|---|
+| *(automatic)* | Every clip posted in the clips channel gets a rating reply. Videos you upload there yourself are rated too. |
+| `/rate [message_link] [video]` | Rate a specific message or an uploaded video. |
+| `/outcome clip_id views` | Report real views after posting. Future ratings use these to calibrate. |
+| `/learn clip url` | Add one viral TikTok/IG/Shorts clip to the reference library. |
+| `/learn account url [min_views]` | Keep learning from an account's clips above `min_views`. |
+| `/learn accounts` · `forget` · `library` | |
+
+## Setup
+
+### 1. Create the two Discord bots
+1. Go to <https://discord.com/developers/applications> and create an application named "Clipper". Under **Bot**, copy the token.
+2. Do it again for "Rater". On the Rater's **Bot** page, turn on **Message Content Intent**. It needs this to see videos in the clips channel.
+3. For each bot: **OAuth2 → URL Generator**. Tick `bot` and `applications.commands`, and give it the permissions *Send Messages, Embed Links, Attach Files, Read Message History, Add Reactions*. Open the URL to invite the bot to your server.
+4. In Discord, enable Developer Mode, then right-click your server → *Copy Server ID*. That value is `DISCORD_GUILD_ID`.
+
+### 2. Get an Anthropic API key
+Create one at <https://console.anthropic.com/>. It powers clip selection, the permission check and the rater. Without a key the clipper still works using loudness + speech heuristics, but the rater won't.
+
+### 3. Create the Oracle VM
+1. Oracle Cloud console → *Compute → Instances → Create*. Pick **Ubuntu 24.04**, shape **VM.Standard.A1.Flex** (Ampere ARM; *Always Free* covers up to 4 OCPU / 24 GB RAM), and a boot volume of 100 GB or more.
+2. SSH in and run:
+   ```bash
+   git clone <this repo> stream-bot && cd stream-bot
+   bash deploy/oracle-setup.sh
+   nano .env              # paste tokens, key, PUBLIC_BASE_URL=http://<VM public IP>:8080
+   ```
+3. In *Networking → Virtual Cloud Networks → your VCN → Security Lists*, add an **Ingress rule: TCP 8080 from 0.0.0.0/0**. This lets the "Download full quality" links work.
+4. Log out and back in, then:
+   ```bash
+   docker compose up -d --build
+   docker compose logs -f
+   ```
+5. In Discord: `/setup clips_channel:#clips clipper_feed_channel:#clipper-feed log_channel:#bot-log`, then `/streamer add`.
+
+Updating later: `git pull && docker compose up -d --build`.
+
+### Cookies (Instagram, and often YouTube)
+Instagram won't serve videos without a logged-in session. YouTube often blocks cloud-server IPs with "Sign in to confirm you're not a bot". Export a `cookies.txt` from a browser where you're logged in, using a cookies.txt export extension. **Use a throwaway account**, because the platforms can ban accounts used for scraping. Then put it in `./data/cookies.txt` and set `YTDLP_COOKIES=/data/cookies.txt`.
+
+## Things to know
+
+* **Speed.** Everything runs on CPU. A long VOD takes a while: downloading audio, scanning it, transcribing ~12 moments, then rendering each clip with x264. Jobs run one at a time and post progress to Discord. To trade quality for speed, set `WHISPER_MODEL=base` and `RENDER_PRESET=superfast`.
+* **Discord's 10 MB upload limit.** A 2.5-minute 1080p clip is bigger than that, so Discord gets a smaller 540p preview and the full-quality file is served from the VM (`PUBLIC_BASE_URL`). Files are deleted after `CLIP_RETENTION_DAYS`.
+* **Claude costs.** Clip selection, permission checks, rating and learning all call `claude-opus-5-5` by default, roughly a few cents per clip rated or reference learned. `CLAUDE_MODEL=claude-sonnet-5-5` is about half the price. Requests opt into Anthropic's server-side refusal fallback, so a false-positive safety decline is retried on a fallback model instead of failing the job.
+* **TikTok / Instagram scraping.** Collecting clipper posts and learning from viral clips uses yt-dlp. It can break when those sites change, and it's against their terms of service. Keep `yt-dlp` updated (`docker compose build --no-cache`).
+* **Permission check is best-effort.** It can only read what's in the public profile. You're still responsible for following each streamer's rules. That's why `unknown` never auto-clips.
+* **Posting to TikTok/Instagram/Facebook** is still manual. Download the clip, then use the rater's suggested caption and hashtags.
+
+## Development
+
+```bash
+pip install -r requirements.txt pytest
+python -m pytest            # unit tests + ffmpeg render tests
+DATA_DIR=./data python -m clipper   # or: python -m rater
+```
+
+Layout: `shared/` (config, SQLite, yt-dlp, Claude, whisper, permissions), `clipper/` (highlights, facecam, subtitles, render, pipeline, bot), `rater/` (learner, scorer, bot).
