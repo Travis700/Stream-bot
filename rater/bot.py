@@ -14,6 +14,7 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
+from shared import health, platforms
 from shared.config import settings
 from shared.db import Database, dumps
 
@@ -75,6 +76,8 @@ class RaterBot(discord.Client):
         else:
             await self.tree.sync()
         self.reference_watcher.start()
+        self.view_tracker.start()
+        self.self_update.start()
 
     async def on_ready(self) -> None:
         log.info("Rater bot ready as %s", self.user)
@@ -140,6 +143,33 @@ class RaterBot(discord.Client):
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
+    @tasks.loop(hours=6)
+    async def view_tracker(self) -> None:
+        """Re-check view counts of clips you posted, so ratings calibrate on real results."""
+        cutoff = time.time() - settings.view_tracking_days * 86400
+        for post in self.db.all("SELECT * FROM clip_posts WHERE created_at > ? AND url LIKE 'http%'", (cutoff,)):
+            try:
+                await update_post_views(self.db, post)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("View check failed for %s: %s", post["url"], exc)
+            await asyncio.sleep(5)  # be gentle with the platforms
+
+    @view_tracker.before_loop
+    async def _wait_ready_views(self) -> None:
+        await self.wait_until_ready()
+
+    @tasks.loop(hours=24)
+    async def self_update(self) -> None:
+        """Restart (the container entrypoint then updates yt-dlp) when a new yt-dlp is out and we're idle."""
+        if self.self_update.current_loop == 0:
+            return
+        if not await health.ytdlp_update_available():
+            return
+        while self.rate_lock.locked():
+            await asyncio.sleep(60)
+        log.info("Newer yt-dlp available; restarting to update")
+        await self.close()
+
     @tasks.loop(minutes=settings.reference_poll_minutes)
     async def reference_watcher(self) -> None:
         if not settings.llm_available("rating"):
@@ -157,10 +187,23 @@ class RaterBot(discord.Client):
         await self.wait_until_ready()
 
 
+async def update_post_views(db: Database, post: dict) -> int | None:
+    info = await asyncio.to_thread(platforms.extract_info, post["url"])
+    views = info.get("view_count")
+    db.execute("UPDATE clip_posts SET views=?, likes=?, last_checked=? WHERE id=?",
+               (views, info.get("like_count"), time.time(), post["id"]))
+    best = db.one("SELECT MAX(views) AS v FROM clip_posts WHERE clip_id=?", (post["clip_id"],))
+    if best and best["v"] is not None:
+        db.execute("UPDATE clips SET actual_views=? WHERE id=?", (best["v"], post["clip_id"]))
+    return views
+
+
 def register_commands(bot: RaterBot) -> None:
     db = bot.db
+    admin = app_commands.default_permissions(manage_guild=True)
 
     @bot.tree.command(name="rate", description="Rate a clip: a message link from the clips channel, or a video file")
+    @admin
     async def rate(interaction: discord.Interaction, message_link: str | None = None,
                    video: discord.Attachment | None = None) -> None:
         await interaction.response.defer(thinking=True)
@@ -191,7 +234,28 @@ def register_commands(bot: RaterBot) -> None:
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
+    @bot.tree.command(name="posted", description="Link a posted TikTok/Reel/Short to a clip; views are tracked automatically")
+    @admin
+    @app_commands.describe(clip_id="The number in 'Clip #…' under the clip", url="Link to the post")
+    async def posted(interaction: discord.Interaction, clip_id: int, url: str) -> None:
+        await interaction.response.defer(thinking=True)
+        clip = db.one("SELECT * FROM clips WHERE id=?", (clip_id,))
+        if not clip:
+            await interaction.followup.send("Clip not found.")
+            return
+        db.execute("INSERT OR IGNORE INTO clip_posts (clip_id, platform, url, created_at) VALUES (?,?,?,?)",
+                   (clip_id, platforms.detect_platform(url), url.strip(), time.time()))
+        post = db.one("SELECT * FROM clip_posts WHERE clip_id=? AND url=?", (clip_id, url.strip()))
+        try:
+            views = await update_post_views(db, post)
+            now = f" It has {views:,} views right now." if views is not None else ""
+        except Exception as exc:  # noqa: BLE001
+            now = f" (Couldn't read its views yet: {str(exc)[:200]})"
+        await interaction.followup.send(f"Tracking views for clip #{clip_id} on <{url}> for the next "
+                                        f"{settings.view_tracking_days} days.{now}")
+
     @bot.tree.command(name="outcome", description="Tell the rater how many views a posted clip actually got")
+    @admin
     async def outcome(interaction: discord.Interaction, clip_id: int, views: app_commands.Range[int, 0]) -> None:
         clip = db.one("SELECT * FROM clips WHERE id=?", (clip_id,))
         if not clip:
@@ -202,7 +266,8 @@ def register_commands(bot: RaterBot) -> None:
             f"Saved: clip #{clip_id} was rated {clip['rating'] or '?'}/10 and got {views:,} views. "
             "Future ratings will use this to calibrate.")
 
-    learn = app_commands.Group(name="learn", description="Teach the rater what viral streamer clips look like")
+    learn = app_commands.Group(name="learn", description="Teach the rater what viral streamer clips look like",
+                               default_permissions=discord.Permissions(manage_guild=True))
 
     @learn.command(name="clip", description="Add one viral TikTok/Instagram/Shorts clip to the reference library")
     async def learn_clip(interaction: discord.Interaction, url: str) -> None:

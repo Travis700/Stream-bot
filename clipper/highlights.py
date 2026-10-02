@@ -39,6 +39,7 @@ class ClipPlan:
     reason: str
     score: float
     words: list[Word]     # timestamps relative to clip start
+    hook_text: str = ""   # short on-screen text for the first seconds
 
 
 def excitement_curve(loudness: np.ndarray, baseline_seconds: int = 300, smooth_seconds: int = 4) -> np.ndarray:
@@ -170,10 +171,13 @@ SELECT_SCHEMA = {
                     "start_offset": {"type": "number", "description": "Seconds from the candidate's start"},
                     "end_offset": {"type": "number", "description": "Seconds from the candidate's start"},
                     "title": {"type": "string"},
+                    "hook_text": {"type": "string",
+                                  "description": "On-screen hook for the first 3-4 seconds: max 7 words, no emoji, "
+                                                 "teases the payoff without spoiling it"},
                     "reason": {"type": "string"},
                     "virality": {"type": "integer", "description": "1-10 estimate of short-form potential"},
                 },
-                "required": ["candidate_id", "start_offset", "end_offset", "title", "reason", "virality"],
+                "required": ["candidate_id", "start_offset", "end_offset", "title", "hook_text", "reason", "virality"],
                 "additionalProperties": False,
             },
         }
@@ -230,7 +234,7 @@ async def llm_plans(candidates: list[Candidate], count: int, min_len: int, max_l
         plans.append(ClipPlan(
             start=c.start + rel_start, end=c.start + rel_end, title=item["title"].strip()[:120],
             reason=item["reason"].strip()[:500], score=float(item["virality"]),
-            words=words_in_range(c.words, rel_start, rel_end),
+            words=words_in_range(c.words, rel_start, rel_end), hook_text=(item.get("hook_text") or "").strip()[:80],
         ))
     return plans
 

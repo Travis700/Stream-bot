@@ -15,6 +15,7 @@ import aiohttp
 import anthropic
 
 from .config import settings
+from .locks import heavy
 
 log = logging.getLogger(__name__)
 
@@ -121,7 +122,7 @@ async def _ask_ollama(system: str, content: list[dict[str, Any]], schema: dict[s
     }
     # CPU inference is slow: allow long requests.
     timeout = aiohttp.ClientTimeout(total=60 * 60)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with heavy("local AI"), aiohttp.ClientSession(timeout=timeout) as session:
         last_error = ""
         pulled = False
         tries = 0

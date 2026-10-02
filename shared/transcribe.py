@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TypedDict
 
 from .config import settings
+from .locks import heavy_sync
 from .media import load_audio
 
 log = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ def transcribe(path: Path, start: float = 0.0, length: float | None = None) -> l
     if audio.size == 0:
         return []
     model = _get_model()
-    with _lock:  # one transcription at a time; the model already uses every core
+    with _lock, heavy_sync("transcribe"):  # one at a time; the model already uses every core
         segments, _info = model.transcribe(audio, word_timestamps=True, vad_filter=True, beam_size=1,
                                            condition_on_previous_text=False)
         words: list[Word] = []

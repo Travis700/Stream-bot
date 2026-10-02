@@ -6,9 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from shared.config import settings
+from shared.locks import heavy_sync
 from shared.media import probe, run
 from shared.transcribe import Word
 
+from . import censor
 from .facecam import Box, SceneLayout
 from .subtitles import write_ass
 
@@ -23,6 +25,7 @@ class RenderPlan:
     layout: str
     filter_graph: str
     caption_y: int
+    hook_y: int
 
 
 def _even(v: float) -> int:
@@ -91,7 +94,8 @@ def plan_layout(scene: SceneLayout, requested: str = "auto") -> RenderPlan:
             f"[s2]crop={gw}:{gh}:{gx}:{gy},scale={OUT_W}:{bottom_h},setsar=1[game];"
             f"[cam][game]vstack=inputs=2[stack]"
         )
-        return RenderPlan("split", graph, caption_y=top_h)
+        # Hook sits in the top of the gameplay, under the captions on the seam.
+        return RenderPlan("split", graph, caption_y=top_h, hook_y=top_h + 230)
 
     if layout == "fullcam":
         face = scene.face
@@ -99,7 +103,7 @@ def plan_layout(scene: SceneLayout, requested: str = "auto") -> RenderPlan:
         cw, ch = fit_crop(src_w, src_h, OUT_W / OUT_H)
         cx = _even(min(max(face.cx - cw / 2, 0), src_w - cw))
         graph = f"[src]crop={cw}:{ch}:{cx}:0,scale={OUT_W}:{OUT_H},setsar=1[stack]"
-        return RenderPlan("fullcam", graph, caption_y=int(OUT_H * 0.72))
+        return RenderPlan("fullcam", graph, caption_y=int(OUT_H * 0.72), hook_y=330)
 
     # fit: zoomed 4:3 centre of the stream over a blurred, darkened copy of itself.
     fw, fh = fit_crop(src_w, src_h, 4 / 3)
@@ -112,7 +116,7 @@ def plan_layout(scene: SceneLayout, requested: str = "auto") -> RenderPlan:
         f"[b]crop={fw}:{fh}:{fx}:{fy},scale={OUT_W}:{fg_h},setsar=1[fg];"
         f"[bg][fg]overlay=0:{fg_y}[stack]"
     )
-    return RenderPlan("fit", graph, caption_y=min(OUT_H - 220, fg_y + fg_h + 150))
+    return RenderPlan("fit", graph, caption_y=min(OUT_H - 220, fg_y + fg_h + 150), hook_y=max(260, fg_y - 170))
 
 
 def _filter_path(path: Path) -> str:
@@ -140,32 +144,47 @@ def source_graph(keep: list[tuple[float, float]], has_audio: bool) -> str:
 
 
 def render(source: Path, out: Path, scene: SceneLayout, words: list[Word], duration: float,
-           layout: str = "auto", subtitles: bool = True, keep: list[tuple[float, float]] | None = None) -> str:
+           layout: str = "auto", subtitles: bool = True, keep: list[tuple[float, float]] | None = None,
+           hook_text: str = "", bleeps: list[tuple[float, float]] | None = None) -> str:
     """Render the vertical clip. Returns the layout actually used.
 
-    ``keep`` lists the pieces of ``source`` to keep (jump cuts); ``words`` and ``duration`` must
-    already describe the tightened timeline.
+    ``keep`` lists the pieces of ``source`` to keep (jump cuts). ``words``, ``duration`` and
+    ``bleeps`` (time ranges to bleep/mute) must already be on the tightened timeline.
     """
     plan = plan_layout(scene, layout)
     has_audio = any(st.get("codec_type") == "audio" for st in probe(source)["streams"])
     graph = source_graph(keep or [(0.0, duration)], has_audio) + ";" + plan.filter_graph
     last = "[stack]"
-    if subtitles and words:
-        ass = write_ass(out.with_suffix(".ass"), words, plan.caption_y, settings.subtitle_font, duration)
+    hook_seconds = settings.hook_text_seconds if hook_text else 0.0
+    if (subtitles and words) or hook_seconds:
+        ass = write_ass(out.with_suffix(".ass"), words if subtitles else [], plan.caption_y,
+                        settings.subtitle_font, duration, hook_text=hook_text, hook_y=plan.hook_y,
+                        hook_seconds=hook_seconds)
         fonts = Path(settings.fonts_dir).resolve()
         graph += f";[stack]ass=filename='{_filter_path(ass)}':fontsdir='{_filter_path(fonts)}'[subbed]"
         last = "[subbed]"
     graph += f";{last}fps={settings.render_fps},format=yuv420p[v]"
+
+    inputs = ["-i", str(source)]
     audio_args: list[str] = []
     if has_audio:
-        graph += ";[asrc]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]"
+        mute_expr, beep_expr = censor.audio_filter(bleeps or [], settings.bleep_mode)
+        chain = f"volume=enable='{mute_expr}':volume=0," if mute_expr else ""
+        graph += f";[asrc]{chain}loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[anorm]"
+        if beep_expr:
+            inputs += ["-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000"]
+            graph += (f";[1:a]atrim=0:{duration:.3f},volume='0.25*({beep_expr})':eval=frame[beep]"
+                      f";[anorm][beep]amix=inputs=2:duration=first:normalize=0[aout]")
+        else:
+            graph += ";[anorm]anull[aout]"
         audio_args = ["-map", "[aout]", "-c:a", "aac", "-b:a", "160k"]
-    run([
-        "ffmpeg", "-v", "error", "-y", "-i", str(source),
-        "-filter_complex", graph, "-map", "[v]", *audio_args,
-        "-c:v", "libx264", "-preset", settings.render_preset, "-crf", "20", "-profile:v", "high",
-        "-movflags", "+faststart", str(out),
-    ])
+    with heavy_sync("render"):
+        run([
+            "ffmpeg", "-v", "error", "-y", *inputs,
+            "-filter_complex", graph, "-map", "[v]", *audio_args,
+            "-c:v", "libx264", "-preset", settings.render_preset, "-crf", "20", "-profile:v", "high",
+            "-movflags", "+faststart", str(out),
+        ])
     return plan.layout
 
 
@@ -176,12 +195,13 @@ def make_preview(source: Path, out: Path, duration: float, max_bytes: int) -> Pa
     video_kbps = total_kbps - audio_kbps
     if video_kbps < 250:
         return None
-    run([
+    with heavy_sync("preview"):
+        run([
         "ffmpeg", "-v", "error", "-y", "-i", str(source), "-vf", "scale=540:960",
         "-c:v", "libx264", "-preset", settings.render_preset, "-b:v", f"{video_kbps}k",
         "-maxrate", f"{int(video_kbps * 1.2)}k", "-bufsize", f"{video_kbps * 2}k",
         "-c:a", "aac", "-b:a", f"{audio_kbps}k", "-movflags", "+faststart", str(out),
-    ])
+        ])
     if out.stat().st_size > max_bytes:
         out.unlink(missing_ok=True)
         return None

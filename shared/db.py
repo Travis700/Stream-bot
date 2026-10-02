@@ -111,6 +111,27 @@ CREATE TABLE IF NOT EXISTS reference_accounts (
     UNIQUE (guild_id, url)
 );
 
+CREATE TABLE IF NOT EXISTS clip_posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    clip_id INTEGER NOT NULL,
+    platform TEXT,
+    url TEXT,
+    external_id TEXT,
+    views INTEGER,
+    likes INTEGER,
+    last_checked REAL,
+    created_at REAL NOT NULL,
+    UNIQUE (clip_id, url)
+);
+
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    service TEXT PRIMARY KEY,
+    access_token TEXT,
+    refresh_token TEXT,
+    expires_at REAL,
+    extra TEXT
+);
+
 CREATE TABLE IF NOT EXISTS reference_clips (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     url TEXT NOT NULL UNIQUE,
@@ -131,7 +152,16 @@ CREATE TABLE IF NOT EXISTS reference_clips (
 
 
 # Columns added after the first release: (table, column, type)
-MIGRATIONS = [("clips", "duration", "REAL")]
+MIGRATIONS = [
+    ("clips", "duration", "REAL"),
+    ("clips", "status", "TEXT NOT NULL DEFAULT 'new'"),   # new | approved | discarded
+    ("clips", "hook_text", "TEXT"),
+    ("clips", "source_path", "TEXT"),      # un-edited source video, kept for re-edits
+    ("clips", "source_words", "TEXT"),     # transcript of the source (relative to its start)
+    ("clips", "options", "TEXT"),          # JSON render options (subtitles, tighten)
+    ("clips", "parent_clip_id", "INTEGER"),
+    ("streamers", "layout", "TEXT"),       # preferred layout for this streamer
+]
 
 
 class Database:

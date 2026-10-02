@@ -21,6 +21,9 @@ RUN mkdir -p assets/fonts \
      || (echo "WARNING: font download failed" && rm -f assets/fonts/Montserrat-ExtraBold.ttf)) \
  && fc-cache -f
 
+COPY deploy/entrypoint.sh /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+
 COPY shared shared
 COPY clipper clipper
 COPY rater rater

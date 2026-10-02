@@ -4,20 +4,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import time
 import traceback
-from pathlib import Path
 
 import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from shared import platforms
+from shared import health, locks, platforms
 from shared.config import settings
 from shared.db import Database
 from shared.permissions import check_permission
 
-from . import fileserver, pipeline
+from . import fileserver, pipeline, posting
 from .render import LAYOUTS
 
 log = logging.getLogger("clipper")
@@ -26,6 +27,7 @@ PLATFORM_CHOICES = [app_commands.Choice(name=p.title(), value=p) for p in platfo
 LAYOUT_CHOICES = [app_commands.Choice(name=n, value=n) for n in LAYOUTS]
 PERMISSION_COLORS = {"allowed": discord.Color.green(), "denied": discord.Color.red(),
                      "unknown": discord.Color.orange()}
+PLATFORM_LABELS = {"tiktok": "TikTok", "instagram": "Instagram", "facebook": "Facebook"}
 
 
 def permission_embed(streamer: dict, sources: list[str] | None = None) -> discord.Embed:
@@ -37,6 +39,7 @@ def permission_embed(streamer: dict, sources: list[str] | None = None) -> discor
     )
     embed.add_field(name="Clipping", value=f"**{status.upper()}** ({streamer['permission_source']})")
     embed.add_field(name="Auto-clip new VODs", value="on" if streamer["auto_clip"] else "off")
+    embed.add_field(name="Layout", value=streamer.get("layout") or "auto")
     if sources:
         embed.add_field(name="Checked", value=", ".join(sources), inline=False)
     if streamer.get("permission_evidence"):
@@ -49,6 +52,78 @@ def permission_embed(streamer: dict, sources: list[str] | None = None) -> discor
     return embed
 
 
+# ====================================================================== clip buttons
+class ClipButton(discord.ui.DynamicItem[discord.ui.Button], template=r"clip:(?P<action>[a-z_]+):(?P<id>\d+)"):
+    """Buttons under each clip. Dynamic, so they keep working after the bot restarts."""
+
+    STYLES = {
+        "approve": ("Approve", "✅", discord.ButtonStyle.success),
+        "discard": ("Discard", "🗑️", discord.ButtonStyle.danger),
+        "shorter": ("Make shorter", "✂️", discord.ButtonStyle.secondary),
+        "layout": ("Change layout", "🔄", discord.ButtonStyle.secondary),
+        "post_tiktok": ("Post to TikTok", "📤", discord.ButtonStyle.primary),
+        "post_instagram": ("Post to Instagram", "📤", discord.ButtonStyle.primary),
+        "post_facebook": ("Post to Facebook", "📤", discord.ButtonStyle.primary),
+    }
+
+    def __init__(self, action: str, clip_id: int) -> None:
+        label, emoji, style = self.STYLES.get(action, (action, None, discord.ButtonStyle.secondary))
+        super().__init__(discord.ui.Button(label=label, emoji=emoji, style=style,
+                                           custom_id=f"clip:{action}:{clip_id}"))
+        self.action = action
+        self.clip_id = clip_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button,
+                             match: re.Match[str]) -> "ClipButton":
+        return cls(match["action"], int(match["id"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        bot: ClipperBot = interaction.client  # type: ignore[assignment]
+        await bot.handle_clip_action(interaction, self.action, self.clip_id)
+
+
+class LayoutPicker(discord.ui.View):
+    def __init__(self, bot: "ClipperBot", clip_id: int, current: str) -> None:
+        super().__init__(timeout=300)
+        self.bot, self.clip_id = bot, clip_id
+        options = [discord.SelectOption(label=name, value=name, default=name == current,
+                                        description={"split": "Facecam on top, gameplay below",
+                                                     "fullcam": "Vertical crop following the face",
+                                                     "fit": "Zoomed gameplay on blurred background"}[name])
+                   for name in ("split", "fullcam", "fit")]
+        select = discord.ui.Select(placeholder="Pick a layout", options=options)
+        select.callback = self._picked  # type: ignore[method-assign]
+        self.select = select
+        self.add_item(select)
+
+    async def _picked(self, interaction: discord.Interaction) -> None:
+        layout = self.select.values[0]
+        job_id = self.bot.enqueue_rerender(interaction, self.clip_id, layout=layout)
+        await interaction.response.edit_message(content=f"Re-rendering with **{layout}** layout (job #{job_id}).",
+                                                view=None)
+
+
+def clip_view(clip: dict, platforms_enabled: list[str]) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    status = clip.get("status") or "new"
+    if status == "new":
+        for action in ("approve", "discard", "shorter", "layout"):
+            view.add_item(ClipButton(action, clip["id"]))
+    elif status == "approved":
+        posted = {p for p in clip.get("_posted", [])}
+        for platform in platforms_enabled:
+            if platform not in posted:
+                view.add_item(ClipButton(f"post_{platform}", clip["id"]))
+        view.add_item(ClipButton("shorter", clip["id"]))
+        view.add_item(ClipButton("layout", clip["id"]))
+    if status != "discarded" and settings.public_base_url and clip.get("token"):
+        view.add_item(discord.ui.Button(label="Download full quality",
+                                        url=f"{settings.public_base_url}/c/{clip['token']}.mp4"))
+    return view
+
+
+# ====================================================================== bot
 class ClipperBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -56,11 +131,13 @@ class ClipperBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.db = Database(settings.db_path)
         self._last_edit: dict[int, float] = {}
+        self.job_running = False
         register_commands(self)
 
     async def setup_hook(self) -> None:
         self.db.requeue_interrupted_jobs()
-        await fileserver.start()
+        self.add_dynamic_items(ClipButton)
+        await fileserver.start(self.db)
         if settings.guild_id:
             guild = discord.Object(id=settings.guild_id)
             self.tree.copy_global_to(guild=guild)
@@ -71,6 +148,7 @@ class ClipperBot(discord.Client):
         self.vod_watcher.start()
         self.clipper_watcher.start()
         self.cleanup.start()
+        self.self_update.start()
 
     async def on_ready(self) -> None:
         log.info("Clipper bot ready as %s", self.user)
@@ -110,12 +188,27 @@ class ClipperBot(discord.Client):
         except discord.HTTPException:
             pass
 
+    def find_existing_job(self, guild_id: int, key: str) -> dict | None:
+        """A queued, running or finished clip job for the same VOD (to avoid duplicate clips)."""
+        return self.db.one(
+            "SELECT * FROM jobs WHERE guild_id=? AND kind='vod' AND json_extract(payload, '$.vod_key')=? "
+            "AND status IN ('queued','running','done') ORDER BY id DESC LIMIT 1", (guild_id, key))
+
+    def enqueue_rerender(self, interaction: discord.Interaction, clip_id: int, layout: str | None = None,
+                         shorter: bool = False) -> int:
+        # Progress goes to the log channel (if set) so the clips channel stays clean.
+        status_channel = self.db.guild_config(interaction.guild_id).get("log_channel_id") or interaction.channel_id
+        return self.db.enqueue_job(interaction.guild_id, "rerender",
+                                   {"clip_id": clip_id, "layout": layout, "shorter": shorter},
+                                   requested_by=interaction.user.id, status_channel_id=status_channel)
+
     # ------------------------------------------------------------------ jobs
     @tasks.loop(seconds=5)
     async def job_worker(self) -> None:
         job = self.db.next_job()
         if not job:
             return
+        self.job_running = True
         if job["status_channel_id"] and not job["status_message_id"]:
             ch = await self.channel(job["status_channel_id"])
             if ch:
@@ -124,7 +217,11 @@ class ClipperBot(discord.Client):
                 self.db.update_job(job["id"], status_message_id=msg.id)
         try:
             started = time.monotonic()
-            clip_ids = await pipeline.process_vod(self.db, job, lambda t: self.set_job_status(job, t))
+            progress = lambda t: self.set_job_status(job, t)  # noqa: E731
+            if job["kind"] == "rerender":
+                clip_ids = await pipeline.rerender_clip(self.db, job, progress)
+            else:
+                clip_ids = await pipeline.process_vod(self.db, job, progress)
             took = pipeline._fmt_len(time.monotonic() - started)
             for clip_id in clip_ids:
                 await self.post_clip(clip_id)
@@ -141,10 +238,46 @@ class ClipperBot(discord.Client):
             await self.set_job_status(job, f"❌ failed: {message[:1500]}", force=True)
             if not job["status_message_id"]:
                 await self.log_to_guild(job["guild_id"], f"Job #{job['id']} failed: {message[:1500]}")
+        finally:
+            self.job_running = False
 
     @job_worker.before_loop
     async def _wait_ready(self) -> None:
         await self.wait_until_ready()
+
+    def clip_embed(self, clip: dict) -> discord.Embed:
+        streamer = self.db.one("SELECT * FROM streamers WHERE id=?", (clip["streamer_id"],)) or {}
+        length = clip.get("duration") or (clip["end_s"] - clip["start_s"])
+        platform = streamer.get("platform", "")
+        status = clip.get("status") or "new"
+        color = {"approved": discord.Color.green(), "discarded": discord.Color.dark_grey()}.get(
+            status, discord.Color.purple())
+        title = ("🗑️ " if status == "discarded" else "") + (clip["title"] or "Clip")
+        embed = discord.Embed(title=title[:256], description=(clip["reason"] or "")[:1500], color=color)
+        if clip.get("hook_text"):
+            embed.add_field(name="On-screen hook", value=clip["hook_text"][:200], inline=False)
+        embed.add_field(name="Streamer", value=streamer.get("display_name") or streamer.get("channel", "?"))
+        embed.add_field(name="Length", value=f"{int(length // 60)}:{int(length % 60):02d}")
+        embed.add_field(name="Layout", value=clip["layout"])
+        embed.add_field(name="Source", value=f"[VOD @ {_hms(clip['start_s'])}]"
+                        f"({platforms.timestamp_url(platform, clip['vod_url'], clip['start_s'])})", inline=False)
+        posts = self.db.all("SELECT * FROM clip_posts WHERE clip_id=?", (clip["id"],))
+        if posts:
+            embed.add_field(name="Posted", value="\n".join(
+                f"{PLATFORM_LABELS.get(p['platform'], p['platform'])}: "
+                + (p["url"] if (p["url"] or "").startswith("http") else "uploaded")
+                + (f" · {p['views']:,} views" if p.get("views") else "") for p in posts)[:1024], inline=False)
+        footer = f"Clip #{clip['id']}"
+        if clip.get("parent_clip_id"):
+            footer += f" · re-edit of #{clip['parent_clip_id']}"
+        embed.set_footer(text=footer)
+        return embed
+
+    def clip_view_for(self, clip: dict) -> discord.ui.View:
+        clip = dict(clip)
+        clip["_posted"] = [p["platform"] for p in self.db.all("SELECT platform FROM clip_posts WHERE clip_id=?",
+                                                               (clip["id"],))]
+        return clip_view(clip, posting.enabled_platforms(self.db))
 
     async def post_clip(self, clip_id: int) -> None:
         clip = self.db.one("SELECT * FROM clips WHERE id=?", (clip_id,))
@@ -155,34 +288,88 @@ class ClipperBot(discord.Client):
         if ch is None:
             log.warning("No clips channel configured for guild %s", clip["guild_id"])
             return
-        streamer = self.db.one("SELECT * FROM streamers WHERE id=?", (clip["streamer_id"],)) or {}
         guild = self.get_guild(clip["guild_id"])
         limit = guild.filesize_limit if guild else 10 * 1024 * 1024
         attachment_path = await asyncio.to_thread(pipeline.make_preview_for, self.db, clip, limit - 200_000)
-
-        length = clip.get("duration") or (clip["end_s"] - clip["start_s"])
-        platform = streamer.get("platform", "")
-        embed = discord.Embed(title=clip["title"][:256], description=(clip["reason"] or "")[:1500],
-                              color=discord.Color.purple())
-        embed.add_field(name="Streamer", value=streamer.get("display_name") or streamer.get("channel", "?"))
-        embed.add_field(name="Length", value=f"{int(length // 60)}:{int(length % 60):02d}")
-        embed.add_field(name="Layout", value=clip["layout"])
-        embed.add_field(name="Source", value=f"[VOD @ {_hms(clip['start_s'])}]"
-                        f"({platforms.timestamp_url(platform, clip['vod_url'], clip['start_s'])})", inline=False)
-        embed.set_footer(text=f"Clip #{clip['id']}")
-
-        view = discord.ui.View()
-        if settings.public_base_url:
-            view.add_item(discord.ui.Button(label="Download full quality",
-                                            url=f"{settings.public_base_url}/c/{clip['token']}.mp4"))
+        embed = self.clip_embed(clip)
         files = []
         if attachment_path:
             files.append(discord.File(attachment_path, filename=f"clip_{clip['id']}.mp4"))
         elif not settings.public_base_url:
             embed.add_field(name="⚠️", value="Clip is too big to upload and PUBLIC_BASE_URL is not set, so "
                                             "there is no download link.", inline=False)
-        msg = await ch.send(embed=embed, files=files, view=view if view.children else None)
+        reference = None
+        if clip.get("parent_clip_id"):
+            parent = self.db.one("SELECT channel_id, message_id FROM clips WHERE id=?", (clip["parent_clip_id"],))
+            if parent and parent["message_id"] and parent["channel_id"] == ch.id:  # type: ignore[union-attr]
+                reference = discord.MessageReference(message_id=parent["message_id"], channel_id=parent["channel_id"],
+                                                     fail_if_not_exists=False)
+        msg = await ch.send(embed=embed, files=files, view=self.clip_view_for(clip), reference=reference)
         self.db.execute("UPDATE clips SET channel_id=?, message_id=? WHERE id=?", (ch.id, msg.id, clip_id))
+
+    async def refresh_clip_message(self, clip_id: int, interaction: discord.Interaction | None = None,
+                                   remove_video: bool = False) -> None:
+        clip = self.db.one("SELECT * FROM clips WHERE id=?", (clip_id,))
+        if not clip or not clip.get("message_id"):
+            return
+        kwargs: dict = {"embed": self.clip_embed(clip), "view": self.clip_view_for(clip)}
+        if remove_video:
+            kwargs["attachments"] = []
+        if interaction is not None and not interaction.response.is_done():
+            await interaction.response.edit_message(**kwargs)
+            return
+        ch = await self.channel(clip["channel_id"])
+        if ch is not None:
+            try:
+                await ch.get_partial_message(clip["message_id"]).edit(**kwargs)  # type: ignore[union-attr]
+            except discord.HTTPException:
+                pass
+
+    async def handle_clip_action(self, interaction: discord.Interaction, action: str, clip_id: int) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not member.guild_permissions.manage_guild:
+            await interaction.response.send_message("Only admins (Manage Server) can use these buttons.",
+                                                    ephemeral=True)
+            return
+        clip = self.db.one("SELECT * FROM clips WHERE id=? AND guild_id=?", (clip_id, interaction.guild_id))
+        if not clip:
+            await interaction.response.send_message("Clip not found.", ephemeral=True)
+            return
+        if action == "approve":
+            self.db.execute("UPDATE clips SET status='approved' WHERE id=?", (clip_id,))
+            await self.refresh_clip_message(clip_id, interaction)
+            await interaction.followup.send(f"✅ Clip #{clip_id} approved by {member.mention}.")
+        elif action == "discard":
+            self.db.execute("UPDATE clips SET status='discarded' WHERE id=?", (clip_id,))
+            await asyncio.to_thread(pipeline.delete_clip_files, self.db, clip)
+            await self.refresh_clip_message(clip_id, interaction, remove_video=True)
+        elif action == "shorter":
+            job_id = self.enqueue_rerender(interaction, clip_id, shorter=True)
+            await interaction.response.send_message(f"✂️ Making a shorter version of clip #{clip_id} (job #{job_id}).")
+        elif action == "layout":
+            await interaction.response.send_message("Which layout?", view=LayoutPicker(self, clip_id, clip["layout"]),
+                                                    ephemeral=True)
+        elif action.startswith("post_"):
+            platform = action.removeprefix("post_")
+            if platform not in posting.enabled_platforms(self.db):
+                await interaction.response.send_message(f"{PLATFORM_LABELS.get(platform, platform)} isn't set up.",
+                                                        ephemeral=True)
+                return
+            await interaction.response.send_message(
+                f"📤 Posting clip #{clip_id} to {PLATFORM_LABELS[platform]}… (this can take a few minutes)")
+            asyncio.create_task(self._post_in_background(interaction, clip, platform))
+
+    async def _post_in_background(self, interaction: discord.Interaction, clip: dict, platform: str) -> None:
+        clip["rating_json"] = (self.db.one("SELECT rating_json FROM clips WHERE id=?", (clip["id"],)) or {}).get(
+            "rating_json")
+        try:
+            result = await posting.post_clip(self.db, clip, platform)
+            where = result.get("url") or result.get("note") or "done"
+            await interaction.followup.send(f"✅ Posted clip #{clip['id']} to {PLATFORM_LABELS[platform]}: {where}")
+            await self.refresh_clip_message(clip["id"])
+        except Exception as exc:  # noqa: BLE001
+            log.error("Posting failed: %s", traceback.format_exc())
+            await interaction.followup.send(f"❌ Posting to {PLATFORM_LABELS[platform]} failed: {str(exc)[:1500]}")
 
     # ------------------------------------------------------------------ watchers
     @tasks.loop(minutes=settings.vod_poll_minutes)
@@ -207,15 +394,18 @@ class ClipperBot(discord.Client):
             exists = self.db.one("SELECT id FROM vods WHERE streamer_id=? AND vod_id=?", (streamer["id"], vod["id"]))
             if exists:
                 continue
-            status = "seen" if seed_only else "queued"
+            key = pipeline.vod_key(vod["url"])
+            already = self.find_existing_job(streamer["guild_id"], key)
+            status = "seen" if (seed_only or already) else "queued"
             row_id = self.db.execute(
                 "INSERT INTO vods (streamer_id, vod_id, url, title, status, created_at) VALUES (?,?,?,?,?,?)",
                 (streamer["id"], vod["id"], vod["url"], vod.get("title"), status, time.time()),
             )
-            if not seed_only:
+            if status == "queued":
                 cfg = self.db.guild_config(streamer["guild_id"])
                 self.db.enqueue_job(streamer["guild_id"], "vod",
-                                    {"url": vod["url"], "streamer_id": streamer["id"], "vod_row_id": row_id},
+                                    {"url": vod["url"], "vod_key": key, "streamer_id": streamer["id"],
+                                     "vod_row_id": row_id},
                                     status_channel_id=cfg.get("log_channel_id"))
                 queued += 1
         return queued
@@ -259,10 +449,20 @@ class ClipperBot(discord.Client):
     async def cleanup(self) -> None:
         cutoff = time.time() - settings.clip_retention_days * 86400
         for clip in self.db.all("SELECT * FROM clips WHERE created_at < ? AND file_path IS NOT NULL", (cutoff,)):
-            for key in ("file_path", "preview_path"):
-                if clip.get(key):
-                    Path(clip[key]).unlink(missing_ok=True)
-            self.db.execute("UPDATE clips SET file_path=NULL, preview_path=NULL WHERE id=?", (clip["id"],))
+            await asyncio.to_thread(pipeline.delete_clip_files, self.db, clip)
+
+    @tasks.loop(hours=24)
+    async def self_update(self) -> None:
+        """Restart (container entrypoint then updates yt-dlp) when a new yt-dlp is out and we're idle."""
+        if self.self_update.current_loop == 0:
+            return  # just started; the entrypoint already updated
+        newer = await health.ytdlp_update_available()
+        if not newer:
+            return
+        while self.job_running or self.db.one("SELECT 1 FROM jobs WHERE status='running'"):
+            await asyncio.sleep(60)
+        log.info("yt-dlp %s is available; restarting to update", newer)
+        await self.close()
 
 
 def _hms(seconds: float) -> str:
@@ -296,6 +496,61 @@ def register_commands(bot: ClipperBot) -> None:
             f"Clips → {clips_channel.mention}"
             + (f"\nClipper feed → {clipper_feed_channel.mention}" if clipper_feed_channel else "")
             + (f"\nLogs → {log_channel.mention}" if log_channel else ""), ephemeral=True)
+
+    # ---------------- /status
+    @bot.tree.command(name="status", description="Check that everything is working (sites, AI, disk, queue)")
+    @admin
+    async def status(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        sites, ai = await asyncio.gather(health.check_sites(), health.check_ai())
+        free, total, clips_gb = await asyncio.to_thread(health.disk_report)
+        newer = await health.ytdlp_update_available()
+        ok = lambda good: "🟢" if good else "🔴"  # noqa: E731
+        embed = discord.Embed(title="Bot status", color=discord.Color.blurple())
+        embed.add_field(name="Sites (reachable ≠ downloads work)", inline=False,
+                        value="\n".join(f"{ok(g)} {n}: {d}" for n, g, d in sites))
+        embed.add_field(name="AI", inline=False, value="\n".join(f"{ok(g)} {n}: {d}" for n, g, d in ai) or "—")
+        cookies = bool(settings.ytdlp_cookies) and os.path.exists(settings.ytdlp_cookies)
+        embed.add_field(name="Downloads", inline=False, value=(
+            f"yt-dlp {health.ytdlp_version()}" + (f" (update {newer} available, auto-restart pending)" if newer else "")
+            + f"\nCookies file: {'loaded' if cookies else 'none'}"))
+        embed.add_field(name="Disk", value=f"{ok(free > 15)} {free:.0f} GB free of {total:.0f} GB "
+                                           f"(clips use {clips_gb:.1f} GB)", inline=False)
+        counts = {r["status"]: r["n"] for r in db.all(
+            "SELECT status, COUNT(*) AS n FROM jobs WHERE guild_id=? GROUP BY status", (interaction.guild_id,))}
+        embed.add_field(name="Jobs", inline=False, value=(
+            f"⚙️ {counts.get('running', 0)} running · ⏳ {counts.get('queued', 0)} queued · "
+            f"✅ {counts.get('done', 0)} done · ❌ {counts.get('failed', 0)} failed"
+            + f"\nCPU: {'busy (a heavy task is running)' if locks.is_busy() else 'idle'}"))
+        fails = db.all("SELECT id, error FROM jobs WHERE guild_id=? AND status='failed' AND error<>'cancelled' "
+                       "ORDER BY id DESC LIMIT 3", (interaction.guild_id,))
+        if fails:
+            embed.add_field(name="Recent failures", inline=False,
+                            value="\n".join(f"#{f['id']}: {(f['error'] or '')[:250]}" for f in fails)[:1024])
+        week = time.time() - 7 * 86400
+        stats = db.one("SELECT COUNT(*) AS made, SUM(rating IS NOT NULL) AS rated, SUM(status='approved') AS approved "
+                       "FROM clips WHERE guild_id=? AND created_at>?", (interaction.guild_id, week))
+        embed.add_field(name="Last 7 days", inline=False,
+                        value=f"{stats['made'] or 0} clips made · {stats['rated'] or 0} rated · "
+                              f"{stats['approved'] or 0} approved")
+        enabled = posting.enabled_platforms(db)
+        embed.add_field(name="Auto-posting", inline=False,
+                        value=", ".join(PLATFORM_LABELS[p] for p in enabled) or "not set up (optional)")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # ---------------- /connect
+    @bot.tree.command(name="connect", description="Connect an account for auto-posting")
+    @admin
+    @app_commands.choices(platform=[app_commands.Choice(name="TikTok", value="tiktok")])
+    async def connect(interaction: discord.Interaction, platform: app_commands.Choice[str]) -> None:
+        if not (settings.tiktok_client_key and settings.tiktok_client_secret and settings.public_base_url):
+            await interaction.response.send_message(
+                "Set TIKTOK_CLIENT_KEY, TIKTOK_CLIENT_SECRET and an https PUBLIC_BASE_URL first (see README).",
+                ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Open this link, log in to the TikTok account you post from and approve the app (link works for 15 "
+            f"min):\n{posting.tiktok_authorize_url()}", ephemeral=True)
 
     # ---------------- /streamer
     streamer_group = app_commands.Group(name="streamer", description="Manage the streamers you clip",
@@ -352,7 +607,8 @@ def register_commands(bot: ClipperBot) -> None:
             return
         icon = {"allowed": "🟢", "denied": "🔴", "unknown": "🟠"}
         lines = [f"{icon.get(r['permission'], '⚪')} **{r['channel']}** ({r['platform']}) — {r['permission']}"
-                 f"{' · auto' if r['auto_clip'] else ''}" for r in rows]
+                 f"{' · auto' if r['auto_clip'] else ''}{' · ' + r['layout'] if r.get('layout') else ''}"
+                 for r in rows]
         await interaction.response.send_message("\n".join(lines)[:2000])
 
     @streamer_group.command(name="permission", description="Manually set whether a streamer may be clipped")
@@ -396,6 +652,19 @@ def register_commands(bot: ClipperBot) -> None:
         db.execute("UPDATE streamers SET auto_clip=? WHERE id=?", (int(enabled), s["id"]))
         await interaction.response.send_message(f"Auto-clip for {s['channel']}: {'on' if enabled else 'off'}")
 
+    @streamer_group.command(name="layout", description="Always use this layout for a streamer's clips")
+    @app_commands.autocomplete(name=streamer_autocomplete)
+    @app_commands.choices(layout=LAYOUT_CHOICES)
+    @app_commands.describe(layout="auto = detect the facecam every time")
+    async def streamer_layout(interaction: discord.Interaction, name: str, layout: app_commands.Choice[str]) -> None:
+        s = db.find_streamer(interaction.guild_id, name)
+        if not s:
+            await interaction.response.send_message("Not found.", ephemeral=True)
+            return
+        db.execute("UPDATE streamers SET layout=? WHERE id=?",
+                   (None if layout.value == "auto" else layout.value, s["id"]))
+        await interaction.response.send_message(f"{s['channel']}'s clips will use the **{layout.value}** layout.")
+
     bot.tree.add_command(streamer_group)
 
     # ---------------- /clip
@@ -403,15 +672,23 @@ def register_commands(bot: ClipperBot) -> None:
                                     default_permissions=discord.Permissions(manage_guild=True))
 
     async def enqueue_vod(interaction: discord.Interaction, streamer: dict, url: str, count: int | None,
-                          layout: str, subtitles: bool, cut_dead_air: bool) -> None:
+                          layout: str, subtitles: bool, cut_dead_air: bool, force: bool) -> None:
         if streamer["permission"] != "allowed":
             await interaction.followup.send(
                 f"Not clipping **{streamer['channel']}** — clipping status is **{streamer['permission']}**.",
                 embed=permission_embed(streamer))
             return
+        key = pipeline.vod_key(url)
+        existing = bot.find_existing_job(interaction.guild_id, key)
+        if existing and not force:
+            what = {"queued": "is already queued", "running": "is being clipped right now",
+                    "done": "was already clipped"}[existing["status"]]
+            await interaction.followup.send(f"This VOD {what} (job #{existing['id']}). "
+                                            f"Run the command again with `force:True` to clip it again anyway.")
+            return
         job_id = db.enqueue_job(interaction.guild_id, "vod",
-                                {"url": url, "streamer_id": streamer["id"], "count": count, "layout": layout,
-                                 "subtitles": subtitles, "tighten": cut_dead_air},
+                                {"url": url, "vod_key": key, "streamer_id": streamer["id"], "count": count,
+                                 "layout": layout, "subtitles": subtitles, "tighten": cut_dead_air},
                                 requested_by=interaction.user.id, status_channel_id=interaction.channel_id)
         ahead = db.one("SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','running') AND id < ?", (job_id,))
         await interaction.followup.send(f"Queued job **#{job_id}** for {url} "
@@ -419,12 +696,13 @@ def register_commands(bot: ClipperBot) -> None:
 
     @clip_group.command(name="vod", description="Clip a specific VOD (Twitch, Kick or YouTube URL)")
     @app_commands.choices(layout=LAYOUT_CHOICES)
-    @app_commands.describe(count="How many clips to make", layout="auto = detect facecam",
+    @app_commands.describe(count="How many clips to make", layout="auto = streamer's saved layout or detect facecam",
                            subtitles="Burn in captions",
-                           cut_dead_air="Jump-cut pauses where nothing is said or happening")
+                           cut_dead_air="Jump-cut pauses where nothing is said or happening",
+                           force="Clip it even if this VOD was already clipped")
     async def clip_vod(interaction: discord.Interaction, url: str, count: app_commands.Range[int, 1, 10] | None = None,
                        layout: app_commands.Choice[str] | None = None, subtitles: bool = True,
-                       cut_dead_air: bool = True) -> None:
+                       cut_dead_air: bool = True, force: bool = False) -> None:
         await interaction.response.defer(thinking=True)
         platform = platforms.detect_platform(url)
         if platform not in platforms.PLATFORMS:
@@ -450,7 +728,7 @@ def register_commands(bot: ClipperBot) -> None:
             )
             streamer = db.one("SELECT * FROM streamers WHERE id=?", (sid,))
         await enqueue_vod(interaction, streamer, url, count, layout.value if layout else "auto", subtitles,
-                          cut_dead_air)
+                          cut_dead_air, force)
 
     @clip_group.command(name="latest", description="Clip a tracked streamer's most recent finished VOD")
     @app_commands.autocomplete(streamer=streamer_autocomplete)
@@ -458,7 +736,7 @@ def register_commands(bot: ClipperBot) -> None:
     async def clip_latest(interaction: discord.Interaction, streamer: str,
                           count: app_commands.Range[int, 1, 10] | None = None,
                           layout: app_commands.Choice[str] | None = None, subtitles: bool = True,
-                       cut_dead_air: bool = True) -> None:
+                          cut_dead_air: bool = True, force: bool = False) -> None:
         await interaction.response.defer(thinking=True)
         s = db.find_streamer(interaction.guild_id, streamer)
         if not s:
@@ -470,7 +748,7 @@ def register_commands(bot: ClipperBot) -> None:
             await interaction.followup.send("No finished VODs found.")
             return
         await enqueue_vod(interaction, s, vods[0]["url"], count, layout.value if layout else "auto", subtitles,
-                          cut_dead_air)
+                          cut_dead_air, force)
 
     @clip_group.command(name="jobs", description="Show the clip job queue")
     async def clip_jobs(interaction: discord.Interaction) -> None:
@@ -481,9 +759,10 @@ def register_commands(bot: ClipperBot) -> None:
         icon = {"queued": "⏳", "running": "⚙️", "done": "✅", "failed": "❌"}
         lines = []
         for r in rows:
-            url = json.loads(r["payload"]).get("url", "")
+            payload = json.loads(r["payload"])
+            what = f"<{payload['url']}>" if payload.get("url") else f"re-edit of clip #{payload.get('clip_id')}"
             detail = r["error"] if r["status"] == "failed" else (r["progress"] or "")
-            lines.append(f"{icon.get(r['status'], '•')} **#{r['id']}** <{url}> — {detail[:150]}")
+            lines.append(f"{icon.get(r['status'], '•')} **#{r['id']}** {what} — {(detail or '')[:150]}")
         await interaction.response.send_message("\n".join(lines)[:2000], ephemeral=True)
 
     @clip_group.command(name="cancel", description="Cancel a queued job")

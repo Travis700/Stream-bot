@@ -46,6 +46,11 @@ class Settings:
     clip_max_seconds: int = field(default_factory=lambda: _int("CLIP_MAX_SECONDS", 120))
     # Jump-cut pauses where nobody talks and the audio is quiet.
     cut_dead_air: bool = field(default_factory=lambda: os.getenv("CUT_DEAD_AIR", "1").strip() not in ("0", "false", "no"))
+    # On-screen hook text (the AI's punchy title) for the first N seconds. 0 = off.
+    hook_text_seconds: float = field(default_factory=lambda: _float("HOOK_TEXT_SECONDS", 4.0))
+    # Slur filter: beep | mute | off. BLEEP_WORDS adds extra comma-separated words.
+    bleep_mode: str = field(default_factory=lambda: os.getenv("BLEEP_MODE", "beep").strip().lower())
+    bleep_words: str = field(default_factory=lambda: os.getenv("BLEEP_WORDS", ""))
     clips_per_vod: int = field(default_factory=lambda: _int("CLIPS_PER_VOD", 4))
     clip_retention_days: int = field(default_factory=lambda: _int("CLIP_RETENTION_DAYS", 7))
     render_fps: int = field(default_factory=lambda: _int("RENDER_FPS", 30))
@@ -65,6 +70,19 @@ class Settings:
     yunet_model: str = field(default_factory=lambda: os.getenv("YUNET_MODEL", "./assets/face_detection_yunet.onnx"))
     fonts_dir: str = field(default_factory=lambda: os.getenv("FONTS_DIR", "./assets/fonts"))
     subtitle_font: str = field(default_factory=lambda: os.getenv("SUBTITLE_FONT", "Montserrat ExtraBold"))
+
+    # Days to keep checking view counts of posted clips.
+    view_tracking_days: int = field(default_factory=lambda: _int("VIEW_TRACKING_DAYS", 14))
+
+    # ---- Optional auto-posting (see README) ----
+    tiktok_client_key: str = field(default_factory=lambda: os.getenv("TIKTOK_CLIENT_KEY", ""))
+    tiktok_client_secret: str = field(default_factory=lambda: os.getenv("TIKTOK_CLIENT_SECRET", ""))
+    # SELF_ONLY until TikTok audits your app; then PUBLIC_TO_EVERYONE.
+    tiktok_privacy: str = field(default_factory=lambda: os.getenv("TIKTOK_PRIVACY", "SELF_ONLY"))
+    meta_page_token: str = field(default_factory=lambda: os.getenv("META_PAGE_ACCESS_TOKEN", ""))
+    facebook_page_id: str = field(default_factory=lambda: os.getenv("FACEBOOK_PAGE_ID", ""))
+    instagram_user_id: str = field(default_factory=lambda: os.getenv("INSTAGRAM_USER_ID", ""))
+    meta_graph_version: str = field(default_factory=lambda: os.getenv("META_GRAPH_VERSION", "v21.0"))
 
     rater_min_reference_views: int = field(default_factory=lambda: _int("RATER_MIN_REFERENCE_VIEWS", 100_000))
 
