@@ -27,6 +27,7 @@ VOD ──► download audio only ──► loudness "hype" curve ──┐
 
 * **CPU only.** Speech-to-text uses `faster-whisper` (int8 on CPU), face detection uses OpenCV, and video uses ffmpeg/x264. Only the hype moments get transcribed, so a 6-hour VOD doesn't need 6 hours of transcription.
 * **Chat as a signal.** On Twitch and YouTube the bot reads the VOD's chat replay. Chat suddenly spamming "KEKW", "LMAO", "💀" or "CLIP IT" marks a moment even when the streamer stays quiet. Chat counts alongside loudness, and the AI also sees what chat spammed for each moment. Kick has no usable chat replay, so Kick VODs use audio only.
+* **Viewer clips (Twitch).** If viewers already clipped moments from the VOD on Twitch, those moments get a big boost, more for clips with more views, and the AI is told about them. A moment viewers chose to clip is the strongest sign it's good. This uses Twitch's unofficial web API; if it stops working, the bot just skips this step.
 * **1–2 minute clips with no slow middle.** The AI is told to keep clips tight and use the shortest length that has both the setup and the payoff. Then pauses of 1.5s or more, where nobody is talking *and* the audio is quiet, are jump-cut out. Loud game moments are never cut, and a clip is never trimmed below 1 minute, since TikTok only pays for videos over 1 minute. Turn this off with `cut_dead_air:False` on `/clip` or `CUT_DEAD_AIR=0`.
 * **Facecam handling.** The bot samples frames and finds a face that stays in the same spot, which is the webcam overlay. It then snaps to the overlay's border.
   * `split` layout (gaming): facecam on top, gameplay below. The gameplay crop is moved away from the webcam if the webcam would cover it.
@@ -52,6 +53,7 @@ VOD ──► download audio only ──► loudness "hype" curve ──┐
 
 | Command | |
 |---|---|
+| `/help` | Quick-start guide inside Discord. |
 | `/setup clips_channel [clipper_feed_channel] [log_channel]` | Where things get posted. Run this first. |
 | `/top [days]` | Your best clips by real views, next to what the rater predicted, plus a **rater accuracy** score. This shows whether the ratings are worth trusting yet. |
 | `/selftest` | Makes a 20-second test clip on the server with a synthetic voice and runs every step (speech-to-text, face detector, AI, cuts, captions, hook text, rendering), then posts the clip. **Run this right after deploying.** |
@@ -71,7 +73,7 @@ VOD ──► download audio only ──► loudness "hype" curve ──┐
 
 | Command | |
 |---|---|
-| *(automatic)* | Every clip posted in the clips channel gets a rating reply. Videos you upload there yourself are rated too. |
+| *(automatic)* | Every clip posted in the clips channel gets a rating reply. Videos you upload there yourself are rated too. Clips posted while the rater was offline are picked up within 30 minutes. |
 | `/rate [message_link] [video]` | Rate a specific message or an uploaded video. |
 | `/posted clip_id url` | Link the TikTok/Reel/Short you posted. The bot checks its views every 6 hours for 14 days and uses them to calibrate future ratings. Posts made with the auto-post buttons are tracked automatically when the platform gives back a link. |
 | `/outcome clip_id views` | Enter views by hand instead. |

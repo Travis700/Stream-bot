@@ -173,3 +173,63 @@ def summarize(messages: list[Message], start: float, end: float, delay: float = 
         counts.update(tokens)
     common = ", ".join(f"{tok} ×{n}" for tok, n in counts.most_common(top) if n >= 3)
     return f"{len(window)} messages" + (f"; most spammed: {common}" if common else "")
+
+
+# ---------------------------------------------------------------- Twitch viewer clips
+TWITCH_CLIPS_QUERY = """
+query($login: String!, $cursor: Cursor) {
+  user(login: $login) {
+    clips(first: 100, after: $cursor, criteria: {period: LAST_MONTH, sort: VIEWS_DESC}) {
+      edges { cursor node { slug title viewCount durationSeconds videoOffsetSeconds video { id } } }
+      pageInfo { hasNextPage }
+    }
+  }
+}"""
+
+
+async def twitch_vod_clips(channel: str, vod_id: str, max_pages: int = 5) -> list[dict]:
+    """Clips viewers made from this VOD: [{offset, duration, views, title}] (best-effort, unofficial API)."""
+    vod_id = vod_id.lstrip("v")
+    found: list[dict] = []
+    cursor = None
+    headers = {"Client-ID": TWITCH_CLIENT_ID, "Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            for _ in range(max_pages):
+                body = {"query": TWITCH_CLIPS_QUERY, "variables": {"login": channel, "cursor": cursor}}
+                async with session.post(TWITCH_GQL, json=body, headers=headers) as resp:
+                    data = await resp.json(content_type=None)
+                clips = (((data.get("data") or {}).get("user") or {}).get("clips")) or {}
+                edges = clips.get("edges") or []
+                for edge in edges:
+                    node = edge.get("node") or {}
+                    if str((node.get("video") or {}).get("id")) == vod_id and node.get("videoOffsetSeconds") is not None:
+                        found.append({"offset": float(node["videoOffsetSeconds"]),
+                                      "duration": float(node.get("durationSeconds") or 30),
+                                      "views": int(node.get("viewCount") or 0), "title": node.get("title") or ""})
+                if not edges or not (clips.get("pageInfo") or {}).get("hasNextPage"):
+                    break
+                cursor = edges[-1].get("cursor")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Twitch clip lookup failed for %s: %s", channel, exc)
+    return found
+
+
+def clips_curve(clips: list[dict], length: int) -> np.ndarray:
+    """Excitement curve with a bump wherever viewers clipped (bigger for more-viewed clips)."""
+    curve = np.zeros(max(length, 1), dtype=np.float32)
+    for clip in clips:
+        start = int(clip["offset"])
+        end = min(length, start + int(clip["duration"]))
+        if 0 <= start < length:
+            curve[start:max(end, start + 1)] += 1.0 + np.log10(1 + clip["views"])
+    return curve
+
+
+def clips_summary(clips: list[dict], start: float, end: float) -> str:
+    inside = [c for c in clips if start <= c["offset"] + c["duration"] / 2 <= end]
+    if not inside:
+        return ""
+    inside.sort(key=lambda c: -c["views"])
+    names = "; ".join(f"“{c['title'][:60]}” ({c['views']:,} views)" for c in inside[:3])
+    return f"{len(inside)} viewer clip(s) here: {names}"

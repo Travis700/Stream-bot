@@ -66,6 +66,7 @@ class RaterBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.db = Database(settings.db_path)
         self.rate_lock = asyncio.Lock()
+        self._rating_now: set[int] = set()  # clip ids being rated, so catch-up never double-rates
         register_commands(self)
 
     async def setup_hook(self) -> None:
@@ -78,6 +79,7 @@ class RaterBot(discord.Client):
         self.reference_watcher.start()
         self.view_tracker.start()
         self.self_update.start()
+        self.catch_up_ratings.start()
 
     async def on_ready(self) -> None:
         log.info("Rater bot ready as %s", self.user)
@@ -108,6 +110,10 @@ class RaterBot(discord.Client):
     async def rate_message(self, message: discord.Message) -> discord.Embed | None:
         clip_id = self._clip_id(message)
         clip = self.db.one("SELECT * FROM clips WHERE id=?", (clip_id,)) if clip_id else None
+        if clip_id is not None:
+            if clip_id in self._rating_now:
+                return None
+            self._rating_now.add(clip_id)
         work = settings.work_dir / f"rate_{message.id}"
         work.mkdir(parents=True, exist_ok=True)
         try:
@@ -129,9 +135,11 @@ class RaterBot(discord.Client):
                     title = message.content[:200]
                 await message.add_reaction("👀")
                 rating = await scorer.rate_video(self.db, video, work / "frames", words, title, streamer)
+            rating["score"] = max(1, min(10, int(rating["score"])))
+            rating["hook_score"] = max(1, min(10, int(rating["hook_score"])))
             if clip:
                 self.db.execute("UPDATE clips SET rating=?, rating_json=?, rating_synced=0 WHERE id=?",
-                                (int(rating["score"]), dumps(rating), clip["id"]))
+                                (rating["score"], dumps(rating), clip["id"]))
             embed = rating_embed(rating, clip["id"] if clip else None)
             await message.reply(embed=embed, mention_author=False)
             await message.remove_reaction("👀", self.user)
@@ -142,6 +150,31 @@ class RaterBot(discord.Client):
             return None
         finally:
             shutil.rmtree(work, ignore_errors=True)
+            if clip_id is not None:
+                self._rating_now.discard(clip_id)
+
+    @tasks.loop(minutes=30)
+    async def catch_up_ratings(self) -> None:
+        """Rate clips that were posted while this bot was offline or restarting."""
+        if not settings.llm_available("rating"):
+            return
+        cutoff = time.time() - 2 * 86400
+        rows = self.db.all("SELECT * FROM clips WHERE rating IS NULL AND message_id IS NOT NULL AND file_path IS NOT "
+                           "NULL AND COALESCE(status,'new')<>'discarded' AND created_at>? ORDER BY id", (cutoff,))
+        for clip in rows:
+            if clip["id"] in self._rating_now:
+                continue
+            try:
+                channel = self.get_channel(clip["channel_id"]) or await self.fetch_channel(clip["channel_id"])
+                message = await channel.fetch_message(clip["message_id"])  # type: ignore[union-attr]
+            except discord.HTTPException:
+                continue
+            log.info("Catching up: rating clip #%s", clip["id"])
+            await self.rate_message(message)
+
+    @catch_up_ratings.before_loop
+    async def _wait_ready_catch_up(self) -> None:
+        await self.wait_until_ready()
 
     @tasks.loop(hours=6)
     async def view_tracker(self) -> None:

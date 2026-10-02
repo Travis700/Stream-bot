@@ -60,8 +60,9 @@ def excitement_curve(loudness: np.ndarray, baseline_seconds: int = 300, smooth_s
     return np.convolve(excitement, kernel, mode="same")
 
 
-def combine_signals(audio: np.ndarray, chat: np.ndarray | None, chat_weight: float = 1.2) -> np.ndarray:
-    """Put audio and chat excitement on the same scale and add them."""
+def combine_signals(audio: np.ndarray, chat: np.ndarray | None, chat_weight: float = 1.2,
+                    viewer_clips: np.ndarray | None = None, clips_weight: float = 2.0) -> np.ndarray:
+    """Put audio, chat and viewer-clip signals on the same scale and add them."""
     def norm(x: np.ndarray) -> np.ndarray:
         # Scale by the typical size of the non-zero part, so rare spikes don't scale to zero.
         active = x[x > 1e-6]
@@ -74,6 +75,11 @@ def combine_signals(audio: np.ndarray, chat: np.ndarray | None, chat_weight: flo
         n = min(len(c), len(chat))
         c[:n] = chat[:n]
         combined = combined + chat_weight * norm(c)
+    if viewer_clips is not None and viewer_clips.size and viewer_clips.any():
+        v = np.zeros_like(combined)
+        n = min(len(v), len(viewer_clips))
+        v[:n] = viewer_clips[:n]
+        combined = combined + clips_weight * norm(v)
     return combined
 
 
@@ -199,7 +205,8 @@ async def llm_plans(candidates: list[Candidate], count: int, min_len: int, max_l
         "should happen or be said, with no slow middle stretch. Use the shortest length that keeps the setup and "
         "the payoff; if a moment only works long, cut where it starts to drag rather than padding it. Start each "
         "clip on the beginning of a sentence, ideally right on the hook, and end right after the payoff. When chat "
-        "reaction is given, a big spike means viewers loved that moment."
+        "reaction is given, a big spike means viewers loved that moment, and viewer clips with lots of views are "
+        "the strongest sign of all."
     )
     blocks = []
     for c in candidates:

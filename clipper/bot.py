@@ -232,7 +232,17 @@ class ClipperBot(discord.Client):
                 clip_ids = await pipeline.process_vod(self.db, job, progress)
             took = pipeline._fmt_len(time.monotonic() - started)
             for clip_id in clip_ids:
-                await self.post_clip(clip_id)
+                # A Discord hiccup while posting must not fail (and re-run) the whole job.
+                for attempt in range(3):
+                    try:
+                        await self.post_clip(clip_id)
+                        break
+                    except discord.HTTPException as exc:
+                        log.warning("Posting clip %s failed (try %d): %s", clip_id, attempt + 1, exc)
+                        await asyncio.sleep(10 * (attempt + 1))
+                else:
+                    await self.log_to_guild(job["guild_id"], f"⚠️ Clip #{clip_id} was made but couldn't be posted "
+                                                             f"to Discord. It's still on the server.")
             self.db.update_job(job["id"], status="done")
             if job["payload"].get("vod_row_id"):
                 self.db.execute("UPDATE vods SET status='done' WHERE id=?", (job["payload"]["vod_row_id"],))
@@ -645,6 +655,29 @@ def register_commands(bot: ClipperBot) -> None:
             (settings.llm_available() and settings.llm_available("rating"), "AI configured for clipping and rating"),
         ]
         return "\n".join(f"{'✅' if done else '⬜'} {text}" for done, text in items)
+
+    # ---------------- /help
+    @bot.tree.command(name="help", description="How to use the clip bots")
+    async def help_cmd(interaction: discord.Interaction) -> None:
+        embed = discord.Embed(title="🎬 Clip bot — quick guide", color=discord.Color.blurple(), description=(
+            "**First time**\n"
+            "1. `/setup` — pick the clips channel (and a log channel)\n"
+            "2. `/selftest` — checks the server can make clips\n"
+            "3. `/streamer add` — track a streamer; it checks whether they allow clipping\n"
+            "4. `/streamer permission … allowed` — if the check couldn't tell (🟠), confirm it yourself\n\n"
+            "**Making clips**\n"
+            "• New VODs from allowed streamers are clipped automatically\n"
+            "• `/clip vod <link>` or `/clip latest <streamer>` to clip one now\n"
+            "• `/clip jobs` shows progress\n\n"
+            "**Reviewing**\n"
+            "• Under each clip: ✅ approve · 🗑️ discard · ✂️ shorter · 🔄 layout\n"
+            "• The rater bot replies with a 1–10 score, fixes and a caption\n"
+            "• `/streamer layout` if a streamer's facecam keeps coming out wrong\n\n"
+            "**After posting**\n"
+            "• `/posted <clip #> <link>` (rater bot) to track real views\n"
+            "• `/top` to see your best clips and how accurate the rater is\n\n"
+            "**Something wrong?** `/status` shows what's broken and how to fix it."))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ---------------- /top
     @bot.tree.command(name="top", description="Best clips by real views, and how well the rater predicted them")

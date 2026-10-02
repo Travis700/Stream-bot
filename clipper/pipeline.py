@@ -143,6 +143,10 @@ async def process_vod(db: Database, job: dict, progress: Progress) -> list[int]:
     if streamer["permission"] != "allowed":
         raise JobError(f"Clipping is not allowed for {streamer['channel']} (status: {streamer['permission']}).")
     layout = resolve_layout(p.get("layout"), streamer)
+    # A retried or interrupted run may have rendered clips that were never posted: start clean.
+    for old in db.all("SELECT * FROM clips WHERE job_id=? AND message_id IS NULL", (job["id"],)):
+        delete_clip_files(db, old)
+        db.execute("DELETE FROM clips WHERE id=?", (old["id"],))
 
     work = settings.work_dir / f"job{job['id']}"
     work.mkdir(parents=True, exist_ok=True)
@@ -168,7 +172,14 @@ async def process_vod(db: Database, job: dict, progress: Progress) -> list[int]:
         chat_curve = None
         if messages:
             chat_curve = chat.chat_excitement(chat.chat_activity(messages, len(loud)))
-        excitement = highlights.combine_signals(audio_excitement, chat_curve)
+        viewer_clips: list[dict] = []
+        if streamer["platform"] == "twitch":
+            viewer_clips = await chat.twitch_vod_clips(streamer["channel"], str(info.get("id") or ""))
+            if viewer_clips:
+                await progress(f"Found {len(viewer_clips)} clip(s) viewers already made from this VOD…")
+        excitement = highlights.combine_signals(
+            audio_excitement, chat_curve,
+            viewer_clips=chat.clips_curve(viewer_clips, len(loud)) if viewer_clips else None)
         window = settings.clip_max_seconds + 40
         # Fewer candidates for a local CPU model keeps the selection prompt (and wait) reasonable.
         max_candidates = min(count * 2, 8) if llm.is_local() else min(count * 3, 12)
@@ -180,7 +191,8 @@ async def process_vod(db: Database, job: dict, progress: Progress) -> list[int]:
         for i, (start, end, score) in enumerate(windows, 1):
             await progress(f"Transcribing candidate moment {i}/{len(windows)}…")
             words = await asyncio.to_thread(transcribe, audio, start, end - start)
-            reaction = chat.summarize(messages, start, end) if messages else ""
+            reaction = "; ".join(filter(None, [chat.summarize(messages, start, end) if messages else "",
+                                               chat.clips_summary(viewer_clips, start, end)]))
             candidates.append(highlights.Candidate(i, start, end, score, words, reaction))
 
         await progress("Choosing the best clips…")
