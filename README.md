@@ -30,13 +30,15 @@ VOD ──► download audio only ──► loudness "hype" curve ──┐
 * **1–2 minute clips with no slow middle.** The AI is told to keep clips tight and use the shortest length that has both the setup and the payoff. Then pauses of 1.5s or more, where nobody is talking *and* the audio is quiet, are jump-cut out. Loud game moments are never cut, and a clip is never trimmed below 1 minute, since TikTok only pays for videos over 1 minute. Turn this off with `cut_dead_air:False` on `/clip` or `CUT_DEAD_AIR=0`.
 * **Facecam handling.** The bot samples frames and finds a face that stays in the same spot, which is the webcam overlay. It then snaps to the overlay's border.
   * `split` layout (gaming): facecam on top, gameplay below. The gameplay crop is moved away from the webcam if the webcam would cover it.
-  * `fullcam` layout (Just Chatting / IRL): a 9:16 crop that follows the face.
+  * `fullcam` layout (Just Chatting / IRL): a 9:16 crop that **pans smoothly to follow the streamer** as they move. The pan is speed-limited so it never jerks, and it stays still when they sit still.
   * `fit` layout (no facecam found): zoomed gameplay over a blurred background.
   * You can force any layout with `layout:` on `/clip`.
 * **Captions.** 1–3 words at a time, the current word highlighted in yellow, placed on the seam between cam and game.
 * **Hook text.** For the first 4 seconds a short line like "HE DID NOT SEE THIS COMING" appears in a white box. The AI writes it when it picks the clip. Change the time with `HOOK_TEXT_SECONDS`, or set it to `0` to turn it off.
 * **Slur filter.** Slurs are bleeped (`BLEEP_MODE=beep`) or muted (`mute`) and shown as `N****` in the captions, because TikTok and Instagram often limit the reach of clips that contain them. Normal swearing is left alone; add your own words with `BLEEP_WORDS=word1,word2`.
 * **Review in Discord.** Every clip gets buttons: ✅ **Approve**, 🗑️ **Discard** (deletes the files), ✂️ **Make shorter** (about 30% shorter, keeping the liveliest part), 🔄 **Change layout**. Re-edits reuse the saved source video, so nothing is downloaded again, and the new version is posted as a reply. Only admins can press the buttons.
+* **Ratings on the clip.** When the rater scores a clip, the score shows on the clip's own post. Set `AUTO_APPROVE_RATING=8` to approve clips rated 8+ automatically (off by default).
+* **Daily summary.** Every day at `DIGEST_HOUR_UTC` (default 9:00 UTC), the log channel gets a summary: clips made and approved, average rating, the best clip, total views on posted clips, and a to-do list (clips waiting for review, streamers needing a permission decision, failed jobs).
 * **No duplicates.** A VOD that's already queued or clipped isn't clipped again; use `force:True` to override.
 * **Shares the CPU fairly.** Transcription, rendering and the local AI never run at the same time across the two bots, so neither slows the other down.
 * **Retries network failures.** A job that fails because of a network blip or a site timeout is retried automatically, up to 2 more times, 15 and 30 minutes later. Errors you need to fix yourself (subscriber-only VOD, YouTube asking for cookies, disk full) are explained in plain English instead.
@@ -51,6 +53,7 @@ VOD ──► download audio only ──► loudness "hype" curve ──┐
 | Command | |
 |---|---|
 | `/setup clips_channel [clipper_feed_channel] [log_channel]` | Where things get posted. Run this first. |
+| `/top [days]` | Your best clips by real views, next to what the rater predicted, plus a **rater accuracy** score. This shows whether the ratings are worth trusting yet. |
 | `/selftest` | Makes a 20-second test clip on the server with a synthetic voice and runs every step (speech-to-text, face detector, AI, cuts, captions, hook text, rendering), then posts the clip. **Run this right after deploying.** |
 | `/status` | Health check: can the server reach each site, is the AI running, disk space, job queue, recent errors. **Run this first if something isn't working.** |
 | `/streamer add platform channel [auto_clip]` | Track a streamer and run the clipping-permission check. New VODs are clipped automatically if allowed. |

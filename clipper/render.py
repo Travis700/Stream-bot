@@ -10,7 +10,7 @@ from shared.locks import heavy_sync
 from shared.media import probe, run
 from shared.transcribe import Word
 
-from . import censor
+from . import censor, tighten
 from .facecam import Box, SceneLayout
 from .subtitles import write_ass
 
@@ -69,7 +69,22 @@ def game_crop_x(src_w: int, crop_w: int, cam: Box | None) -> int:
     return _even(best)
 
 
-def plan_layout(scene: SceneLayout, requested: str = "auto") -> RenderPlan:
+def crop_x_expression(keys: list[tuple[float, float]], crop_w: int, src_w: int) -> str:
+    """ffmpeg expression for a crop's x that pans linearly between keyframes [(t, centre_x)]."""
+    xs = [min(max(cx - crop_w / 2, 0), src_w - crop_w) for _, cx in keys]
+    ts = [t for t, _ in keys]
+    expr = f"{xs[-1]:.1f}"
+    for i in range(len(keys) - 2, -1, -1):
+        t0, t1, x0, x1 = ts[i], ts[i + 1], xs[i], xs[i + 1]
+        if t1 <= t0:
+            continue
+        segment = f"{x0:.1f}+({x1 - x0:.1f})*(t-{t0:.2f})/{t1 - t0:.2f}"
+        expr = f"if(lt(t,{t1:.2f}),{segment},{expr})"
+    return f"if(lt(t,{ts[0]:.2f}),{xs[0]:.1f},{expr})"
+
+
+def plan_layout(scene: SceneLayout, requested: str = "auto",
+                track: list[tuple[float, float]] | None = None) -> RenderPlan:
     src_w, src_h = scene.width, scene.height
     layout = requested
     if layout == "auto":
@@ -101,8 +116,11 @@ def plan_layout(scene: SceneLayout, requested: str = "auto") -> RenderPlan:
         face = scene.face
         assert face is not None
         cw, ch = fit_crop(src_w, src_h, OUT_W / OUT_H)
-        cx = _even(min(max(face.cx - cw / 2, 0), src_w - cw))
-        graph = f"[src]crop={cw}:{ch}:{cx}:0,scale={OUT_W}:{OUT_H},setsar=1[stack]"
+        if track and len(track) >= 2:
+            x = f"'{crop_x_expression(track, cw, src_w)}'"  # pan to follow the streamer
+        else:
+            x = str(_even(min(max(face.cx - cw / 2, 0), src_w - cw)))
+        graph = f"[src]crop={cw}:{ch}:{x}:0,scale={OUT_W}:{OUT_H},setsar=1[stack]"
         return RenderPlan("fullcam", graph, caption_y=int(OUT_H * 0.72), hook_y=330)
 
     # fit: zoomed 4:3 centre of the stream over a blurred, darkened copy of itself.
@@ -151,7 +169,13 @@ def render(source: Path, out: Path, scene: SceneLayout, words: list[Word], durat
     ``keep`` lists the pieces of ``source`` to keep (jump cuts). ``words``, ``duration`` and
     ``bleeps`` (time ranges to bleep/mute) must already be on the tightened timeline.
     """
-    plan = plan_layout(scene, layout)
+    track = None
+    if scene.track:
+        # The face track is on the source timeline; move it onto the cut timeline.
+        segments = keep or [(0.0, duration)]
+        inside = [(t, x) for t, x in scene.track if any(s <= t <= e for s, e in segments)]
+        track = [(tighten.remap_time(t, segments), x) for t, x in inside]
+    plan = plan_layout(scene, layout, track)
     has_audio = any(st.get("codec_type") == "audio" for st in probe(source)["streams"])
     graph = source_graph(keep or [(0.0, duration)], has_audio) + ";" + plan.filter_graph
     last = "[stack]"

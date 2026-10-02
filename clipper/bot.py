@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ from shared.config import settings
 from shared.db import Database
 from shared.permissions import check_permission
 
-from . import fileserver, pipeline, posting, selftest
+from . import fileserver, pipeline, posting, selftest, stats
 from .render import LAYOUTS
 
 log = logging.getLogger("clipper")
@@ -153,6 +154,9 @@ class ClipperBot(discord.Client):
         self.cleanup.start()
         self.self_update.start()
         self.backup_db.start()
+        self.rating_sync.start()
+        if settings.digest_hour_utc >= 0:
+            self.daily_digest.start()
 
     async def on_ready(self) -> None:
         log.info("Clipper bot ready as %s", self.user)
@@ -266,6 +270,10 @@ class ClipperBot(discord.Client):
             status, discord.Color.purple())
         title = ("🗑️ " if status == "discarded" else "") + (clip["title"] or "Clip")
         embed = discord.Embed(title=title[:256], description=(clip["reason"] or "")[:1500], color=color)
+        if clip.get("rating") is not None:
+            rating = json.loads(clip.get("rating_json") or "{}")
+            predicted = f" · predicted {rating['predicted_views']}" if rating.get("predicted_views") else ""
+            embed.add_field(name="Rater", value=f"**{clip['rating']}/10**{predicted}", inline=False)
         if clip.get("hook_text"):
             embed.add_field(name="On-screen hook", value=clip["hook_text"][:200], inline=False)
         embed.add_field(name="Streamer", value=streamer.get("display_name") or streamer.get("channel", "?"))
@@ -463,6 +471,41 @@ class ClipperBot(discord.Client):
         for clip in self.db.all("SELECT * FROM clips WHERE created_at < ? AND file_path IS NOT NULL", (cutoff,)):
             await asyncio.to_thread(pipeline.delete_clip_files, self.db, clip)
 
+    @tasks.loop(time=dt.time(hour=max(0, min(23, settings.digest_hour_utc)), tzinfo=dt.timezone.utc))
+    async def daily_digest(self) -> None:
+        for cfg in self.db.all_guild_configs():
+            if not cfg.get("log_channel_id"):
+                continue
+            embed = digest_embed(self.db, cfg["guild_id"])
+            if embed is not None:
+                ch = await self.channel(cfg["log_channel_id"])
+                if ch is not None:
+                    await ch.send(embed=embed)
+
+    @daily_digest.before_loop
+    async def _wait_ready_digest(self) -> None:
+        await self.wait_until_ready()
+
+    @tasks.loop(minutes=1)
+    async def rating_sync(self) -> None:
+        """Show new ratings on the clip messages and auto-approve high scorers."""
+        rows = self.db.all("SELECT * FROM clips WHERE rating IS NOT NULL AND rating_synced=0 "
+                           "AND message_id IS NOT NULL LIMIT 20")
+        for clip in rows:
+            auto = (settings.auto_approve_rating and clip["rating"] >= settings.auto_approve_rating
+                    and (clip.get("status") or "new") == "new")
+            if auto:
+                self.db.execute("UPDATE clips SET status='approved' WHERE id=?", (clip["id"],))
+            self.db.execute("UPDATE clips SET rating_synced=1 WHERE id=?", (clip["id"],))
+            await self.refresh_clip_message(clip["id"])
+            if auto:
+                await self.log_to_guild(clip["guild_id"], f"✅ Auto-approved clip #{clip['id']} "
+                                                          f"(rated {clip['rating']}/10).")
+
+    @rating_sync.before_loop
+    async def _wait_ready_ratings(self) -> None:
+        await self.wait_until_ready()
+
     @tasks.loop(hours=24)
     async def backup_db(self) -> None:
         """Daily copy of the database to data/backups (last 7 kept)."""
@@ -484,6 +527,35 @@ class ClipperBot(discord.Client):
             await asyncio.sleep(60)
         log.info("yt-dlp %s is available; restarting to update", newer)
         await self.close()
+
+
+def digest_embed(db: Database, guild_id: int) -> discord.Embed | None:
+    d = stats.digest(db, guild_id)
+    if d.empty:
+        return None
+    embed = discord.Embed(title="📊 Daily summary (last 24h)", color=discord.Color.blurple())
+    embed.add_field(name="Clips", value=f"{d.clips_made} made · {d.approved} approved · {d.discarded} discarded")
+    if d.avg_rating is not None:
+        embed.add_field(name="Average rating", value=f"{d.avg_rating:.1f}/10")
+    if d.best_clip:
+        link = stats.message_link(guild_id, d.best_clip)
+        title = d.best_clip["title"] or f"Clip #{d.best_clip['id']}"
+        embed.add_field(name="Best clip", inline=False,
+                        value=f"{d.best_clip['rating']}/10 — " + (f"[{title}]({link})" if link else title))
+    if d.views_tracked:
+        top = d.top_post
+        embed.add_field(name="Views on posted clips", inline=False,
+                        value=f"{d.views_tracked:,} total · best: {top['views']:,} on <{top['url']}>")
+    todo = []
+    if d.awaiting_review:
+        todo.append(f"{d.awaiting_review} clip(s) waiting for ✅/🗑️")
+    if d.unknown_streamers:
+        todo.append(f"Decide clipping permission for: {', '.join(d.unknown_streamers[:10])}")
+    if d.jobs_failed:
+        todo.append(f"{d.jobs_failed} job(s) failed — see /clip jobs")
+    if todo:
+        embed.add_field(name="To do", value="\n".join(f"• {t}" for t in todo), inline=False)
+    return embed
 
 
 def _hms(seconds: float) -> str:
@@ -573,6 +645,28 @@ def register_commands(bot: ClipperBot) -> None:
             (settings.llm_available() and settings.llm_available("rating"), "AI configured for clipping and rating"),
         ]
         return "\n".join(f"{'✅' if done else '⬜'} {text}" for done, text in items)
+
+    # ---------------- /top
+    @bot.tree.command(name="top", description="Best clips by real views, and how well the rater predicted them")
+    @admin
+    async def top(interaction: discord.Interaction, days: app_commands.Range[int, 1, 365] = 30) -> None:
+        rows, accuracy = stats.top_clips(db, interaction.guild_id, days)
+        if not rows:
+            await interaction.response.send_message(
+                f"No view data from the last {days} days yet. Link posted clips with `/posted` (rater bot) or "
+                f"use the auto-post buttons.", ephemeral=True)
+            return
+        lines = []
+        for i, r in enumerate(rows, 1):
+            link = stats.message_link(interaction.guild_id, r)
+            title = (r["title"] or f"Clip #{r['id']}")[:60]
+            rated = f"rated {r['rating']}/10" if r.get("rating") is not None else "not rated"
+            lines.append(f"**{i}.** {f'[{title}]({link})' if link else title} — **{r['actual_views']:,}** views "
+                         f"({rated})")
+        embed = discord.Embed(title=f"🏆 Top clips, last {days} days", description="\n".join(lines)[:4000],
+                              color=discord.Color.gold())
+        embed.add_field(name="Rater accuracy", value=accuracy)
+        await interaction.response.send_message(embed=embed)
 
     # ---------------- /selftest
     @bot.tree.command(name="selftest", description="Make a test clip on the server to check every step works")

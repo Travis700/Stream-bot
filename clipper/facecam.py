@@ -50,6 +50,8 @@ class SceneLayout:
     face: Box | None = None   # median face box
     cam: Box | None = None    # estimated facecam overlay (gaming only)
     confidence: float = 0.0
+    # fullcam only: smoothed face centre over time [(seconds, x)] so the crop can follow the streamer
+    track: list[tuple[float, float]] | None = None
 
 
 class FaceDetector:
@@ -176,7 +178,67 @@ def estimate_cam_box(face: Box, frames: list[np.ndarray], width: int, height: in
     return box.clamp(width, height)
 
 
-def analyse(video: Path, detector: FaceDetector | None = None) -> SceneLayout:
+def track_faces(video: Path, detector: FaceDetector, step: float = 0.5, work_width: int = 640
+                ) -> list[tuple[float, float]]:
+    """Centre x (in source pixels) of the main face every ``step`` seconds."""
+    cap = cv2.VideoCapture(str(video))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    every = max(1, int(round(fps * step)))
+    points: list[tuple[float, float]] = []
+    last_x: float | None = None
+    index = 0
+    while True:
+        if not cap.grab():
+            break
+        if index % every == 0:
+            ok, frame = cap.retrieve()
+            if ok:
+                h, w = frame.shape[:2]
+                scale = work_width / w
+                small = cv2.resize(frame, (work_width, int(h * scale)))
+                faces = [b for b, _ in detector.detect(small) if b.h > small.shape[0] * 0.12]
+                if faces:
+                    # Stick with the face nearest the previous position (or the biggest one).
+                    if last_x is None:
+                        best = max(faces, key=lambda b: b.w * b.h)
+                    else:
+                        best = min(faces, key=lambda b: abs(b.cx / scale - last_x))
+                    last_x = best.cx / scale
+                    points.append((index / fps, last_x))
+        index += 1
+    cap.release()
+    return points
+
+
+def smooth_track(points: list[tuple[float, float]], duration: float, width: int, crop_w: int,
+                 key_every: float = 1.0, window: float = 3.0, max_speed: float = 0.25
+                 ) -> list[tuple[float, float]] | None:
+    """Turn noisy face positions into gentle camera keyframes [(t, centre_x)].
+
+    Returns None when the face barely moves (a static crop looks better then).
+    ``max_speed`` is the fastest pan, as a fraction of the frame width per second.
+    """
+    if len(points) < 3:
+        return None
+    ts = np.array([p[0] for p in points])
+    xs = np.array([p[1] for p in points])
+    grid = np.arange(0.0, max(duration, ts[-1]) + key_every, key_every)
+    xs_grid = np.interp(grid, ts, xs)  # fills gaps where no face was found
+    half = max(1, int(window / key_every / 2))
+    kernel = np.ones(2 * half + 1) / (2 * half + 1)
+    padded = np.pad(xs_grid, half, mode="edge")
+    smooth = np.convolve(padded, kernel, mode="valid")
+    limit = max_speed * width * key_every
+    for i in range(1, len(smooth)):
+        smooth[i] = smooth[i - 1] + np.clip(smooth[i] - smooth[i - 1], -limit, limit)
+    lo, hi = crop_w / 2, width - crop_w / 2
+    smooth = np.clip(smooth, lo, hi)
+    if smooth.max() - smooth.min() < width * 0.04:
+        return None
+    return [(round(float(t), 2), round(float(x), 1)) for t, x in zip(grid, smooth)]
+
+
+def analyse(video: Path, detector: FaceDetector | None = None, track: bool = True) -> SceneLayout:
     frames = sample_frames(video)
     if not frames:
         raise RuntimeError(f"Could not read frames from {video}")
@@ -185,10 +247,18 @@ def analyse(video: Path, detector: FaceDetector | None = None) -> SceneLayout:
     detections = [detector.detect(f) for f in frames]
     group, frames_with = _cluster_faces(detections, width, height)
     confidence = frames_with / len(frames)
+    big_faces = [max((b for b, _ in d), key=lambda b: b.h) for d in detections
+                 if d and max(b.h for b, _ in d) > height * 0.2]
+    if (not group or confidence < 0.35) and len(big_faces) >= len(frames) * 0.5:
+        # A large face that moves around (IRL / Just Chatting): no fixed spot, but clearly a facecam.
+        group, confidence = big_faces, len(big_faces) / len(frames)
     if not group or confidence < 0.35:
         return SceneLayout("nocam", width, height, confidence=confidence)
     face = _median_box(group)
     if face.h > height * 0.2:
-        return SceneLayout("fullcam", width, height, face=face, confidence=confidence)
+        points = track_faces(video, detector) if track else []
+        crop_w = int(height * 9 / 16)
+        keyframes = smooth_track(points, float(len(points) and points[-1][0]), width, crop_w) if points else None
+        return SceneLayout("fullcam", width, height, face=face, confidence=confidence, track=keyframes)
     cam = estimate_cam_box(face, frames, width, height)
     return SceneLayout("gaming", width, height, face=face, cam=cam, confidence=confidence)

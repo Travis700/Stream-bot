@@ -162,6 +162,7 @@ MIGRATIONS = [
     ("clips", "parent_clip_id", "INTEGER"),
     ("streamers", "layout", "TEXT"),       # preferred layout for this streamer
     ("jobs", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("clips", "rating_synced", "INTEGER NOT NULL DEFAULT 0"),  # clip message shows the latest rating
     ("jobs", "not_before", "REAL"),        # retry time for jobs that hit a network error
 ]
 

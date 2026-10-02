@@ -130,7 +130,7 @@ class RaterBot(discord.Client):
                 await message.add_reaction("👀")
                 rating = await scorer.rate_video(self.db, video, work / "frames", words, title, streamer)
             if clip:
-                self.db.execute("UPDATE clips SET rating=?, rating_json=? WHERE id=?",
+                self.db.execute("UPDATE clips SET rating=?, rating_json=?, rating_synced=0 WHERE id=?",
                                 (int(rating["score"]), dumps(rating), clip["id"]))
             embed = rating_embed(rating, clip["id"] if clip else None)
             await message.reply(embed=embed, mention_author=False)

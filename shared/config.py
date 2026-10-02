@@ -51,6 +51,10 @@ class Settings:
     # Slur filter: beep | mute | off. BLEEP_WORDS adds extra comma-separated words.
     bleep_mode: str = field(default_factory=lambda: os.getenv("BLEEP_MODE", "beep").strip().lower())
     bleep_words: str = field(default_factory=lambda: os.getenv("BLEEP_WORDS", ""))
+    # Clips the rater scores at or above this are approved automatically (0 = off).
+    auto_approve_rating: int = field(default_factory=lambda: _int("AUTO_APPROVE_RATING", 0))
+    # Hour of the day (UTC) for the daily summary in the log channel (-1 = off).
+    digest_hour_utc: int = field(default_factory=lambda: _int("DIGEST_HOUR_UTC", 9))
     clips_per_vod: int = field(default_factory=lambda: _int("CLIPS_PER_VOD", 4))
     clip_retention_days: int = field(default_factory=lambda: _int("CLIP_RETENTION_DAYS", 7))
     render_fps: int = field(default_factory=lambda: _int("RENDER_FPS", 30))
