@@ -35,7 +35,7 @@ cat <<EOF
 
 Done. Next steps:
   1. In the Oracle console: Networking > VCN > Security List > add an Ingress rule for TCP $PORT (0.0.0.0/0)
-  2. nano .env       (Discord tokens, Anthropic key, PUBLIC_BASE_URL=http://<this VM's public IP>:$PORT)
+  2. nano .env       (Discord tokens, PUBLIC_BASE_URL=http://<this VM's public IP>:$PORT)
   3. Log out and back in (so your user can run docker), then:
        docker compose up -d --build
        docker compose logs -f

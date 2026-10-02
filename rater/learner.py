@@ -58,7 +58,9 @@ async def add_reference(db: Database, url: str, min_views: int = 0) -> dict:
 
         duration = float(info.get("duration") or await asyncio.to_thread(media.duration, path))
         words = await asyncio.to_thread(transcribe, path)
-        frames = await asyncio.to_thread(media.extract_frames, path, frame_times(duration), work / "frames", 512)
+        local = llm.is_local("rating")
+        frames = await asyncio.to_thread(media.extract_frames, path, frame_times(duration, 5 if local else 8),
+                                         work / "frames", 448 if local else 512)
         content = [llm.image_block(f) for f in frames]
         content.append(llm.text_block(
             f"This short-form clip of a livestreamer performed very well.\n"
@@ -69,7 +71,7 @@ async def add_reference(db: Database, url: str, min_views: int = 0) -> dict:
             "Explain concisely what made it perform, so an editor can repeat it."))
         analysis = await llm.ask_json(
             "You analyse viral TikTok / Instagram Reels / Shorts clips of livestreamers for a clipping team.",
-            content, ANALYSIS_SCHEMA, effort="low", max_tokens=4000)
+            content, ANALYSIS_SCHEMA, effort="low", max_tokens=4000, purpose="rating")
         db.execute("UPDATE reference_clips SET streamer=?, analysis=?, status='ready', error=NULL WHERE url=?",
                    (analysis.get("streamer"), dumps(analysis), url))
     except Exception as exc:  # noqa: BLE001

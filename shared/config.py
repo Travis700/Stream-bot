@@ -25,6 +25,16 @@ class Settings:
     # When set, slash commands are synced to this guild instantly instead of globally (~1h).
     guild_id: int = field(default_factory=lambda: _int("DISCORD_GUILD_ID", 0))
 
+    # Which AI does the thinking: "ollama" (free, runs on this server), "anthropic" (Claude, paid) or "none".
+    llm_provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "ollama").strip().lower())
+    # Optional override just for rating clips / learning from viral clips (e.g. "anthropic").
+    rater_llm_provider: str = field(default_factory=lambda: os.getenv("RATER_LLM_PROVIDER", "").strip().lower())
+
+    ollama_url: str = field(default_factory=lambda: os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/"))
+    ollama_text_model: str = field(default_factory=lambda: os.getenv("OLLAMA_TEXT_MODEL", "qwen2.5:7b"))
+    ollama_vision_model: str = field(default_factory=lambda: os.getenv("OLLAMA_VISION_MODEL", "qwen2.5vl:7b"))
+    ollama_num_ctx: int = field(default_factory=lambda: _int("OLLAMA_NUM_CTX", 24576))
+
     anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
     claude_model: str = field(default_factory=lambda: os.getenv("CLAUDE_MODEL", "claude-opus-5-5"))
     claude_effort: str = field(default_factory=lambda: os.getenv("CLAUDE_EFFORT", "medium"))
@@ -68,9 +78,17 @@ class Settings:
     def work_dir(self) -> Path:
         return self.data_dir / "work"
 
-    @property
-    def llm_enabled(self) -> bool:
-        return bool(self.anthropic_api_key)
+    def provider_for(self, purpose: str = "general") -> str:
+        """AI provider for a purpose: "rating" (rater bot) or anything else (clipper)."""
+        if purpose == "rating" and self.rater_llm_provider:
+            return self.rater_llm_provider
+        return self.llm_provider
+
+    def llm_available(self, purpose: str = "general") -> bool:
+        provider = self.provider_for(purpose)
+        if provider == "anthropic":
+            return bool(self.anthropic_api_key)
+        return provider == "ollama"
 
     def ensure_dirs(self) -> None:
         for path in (self.data_dir, self.clips_dir, self.work_dir):

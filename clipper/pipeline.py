@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from shared import media, platforms
+from shared import llm, media, platforms
 from shared.config import settings
 from shared.db import Database, dumps
 from shared.patterns import learned_patterns_text
@@ -55,7 +55,9 @@ async def process_vod(db: Database, job: dict, progress: Progress) -> list[int]:
         loud = await asyncio.to_thread(media.loudness_per_second, audio)
         excitement = highlights.excitement_curve(loud)
         window = settings.clip_max_seconds + 40
-        windows = highlights.pick_windows(excitement, min(count * 3, 12), window)
+        # Fewer candidates for a local CPU model keeps the selection prompt (and wait) reasonable.
+        max_candidates = min(count * 2, 8) if llm.is_local() else min(count * 3, 12)
+        windows = highlights.pick_windows(excitement, max_candidates, window)
         if not windows:
             raise JobError("VOD is too short to clip.")
 
@@ -67,7 +69,7 @@ async def process_vod(db: Database, job: dict, progress: Progress) -> list[int]:
 
         await progress("Choosing the best clips…")
         plans: list[highlights.ClipPlan] = []
-        if settings.llm_enabled:
+        if settings.llm_available():
             try:
                 patterns = await asyncio.to_thread(learned_patterns_text, db, 10, streamer["channel"])
                 plans = await highlights.llm_plans(candidates, count, settings.clip_min_seconds,

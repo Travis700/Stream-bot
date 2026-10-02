@@ -78,8 +78,9 @@ class RaterBot(discord.Client):
 
     async def on_ready(self) -> None:
         log.info("Rater bot ready as %s", self.user)
-        if not settings.llm_enabled:
-            log.error("ANTHROPIC_API_KEY is not set; the rater cannot rate or learn.")
+        if not settings.llm_available("rating"):
+            log.error("No AI configured for rating (provider %r); the rater cannot rate or learn.",
+                      settings.provider_for("rating"))
 
     def is_clips_channel(self, channel_id: int) -> bool:
         return bool(self.db.one("SELECT 1 FROM guild_config WHERE clips_channel_id=?", (channel_id,)))
@@ -141,7 +142,7 @@ class RaterBot(discord.Client):
 
     @tasks.loop(minutes=settings.reference_poll_minutes)
     async def reference_watcher(self) -> None:
-        if not settings.llm_enabled:
+        if not settings.llm_available("rating"):
             return
         for account in self.db.all("SELECT * FROM reference_accounts"):
             try:

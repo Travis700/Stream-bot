@@ -158,14 +158,14 @@ async def _llm_classify(platform: str, channel: str, text: str) -> tuple[str, st
     quote = (answer.get("quote") or "").strip()
     # Never trust an 'allowed' that isn't backed by real text from the profile.
     if answer["status"] != "unknown" and (not quote or quote.lower() not in text.lower()):
-        return "unknown", f"Claude suggested {answer['status']} but could not quote the profile."
+        return "unknown", f"The AI suggested {answer['status']} but could not quote the profile."
     return answer["status"], quote or answer.get("explanation", "")
 
 
 async def check_permission(platform: str, channel: str) -> PermissionResult:
     text, sources = await asyncio.to_thread(fetch_profile_text, platform, channel)
     status, evidence = classify_text(text)
-    if status == "unknown" and text.strip() and settings.llm_enabled:
+    if status == "unknown" and text.strip() and settings.llm_available():
         judged = await _llm_classify(platform, channel, text)
         if judged:
             status, evidence = judged

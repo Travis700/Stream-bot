@@ -57,9 +57,12 @@ async def rate_video(db: Database, video: Path, work: Path, words: list[Word] | 
     duration = await asyncio.to_thread(media.duration, video)
     if words is None:
         words = await asyncio.to_thread(transcribe, video)
-    frames = await asyncio.to_thread(media.extract_frames, video, frame_times(duration, 10), work, 540)
+    # A local CPU model is much slower per image, so send it fewer, smaller frames and fewer references.
+    local = llm.is_local("rating")
+    frames = await asyncio.to_thread(media.extract_frames, video, frame_times(duration, 5 if local else 10), work,
+                                     448 if local else 540)
 
-    cards = await asyncio.to_thread(reference_cards, db, 25, streamer)
+    cards = await asyncio.to_thread(reference_cards, db, 10 if local else 25, streamer)
     library = "\n".join(format_card(c) for c in cards) or "(library is empty — rely on general knowledge)"
     calibration = await asyncio.to_thread(calibration_text, db)
 
@@ -74,4 +77,4 @@ async def rate_video(db: Database, video: Path, work: Path, words: list[Word] | 
         f"Clip to rate. Title/caption idea: {title or '(none)'}\nStreamer: {streamer or 'unknown'}\n"
         f"Length: {duration:.0f}s\nThe images are frames in order (first three are from the first 3 seconds).\n\n"
         f"Transcript:\n{words_to_text(words) or '(no speech)'}"))
-    return await llm.ask_json(SYSTEM, content, RATING_SCHEMA, max_tokens=8000)
+    return await llm.ask_json(SYSTEM, content, RATING_SCHEMA, max_tokens=8000, purpose="rating")

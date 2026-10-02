@@ -13,7 +13,7 @@ Two Discord bots that run on a cloud server (built for Oracle Cloud's free ARM V
 VOD ──► download audio only ──► loudness "hype" curve ──► top moments
                                                             │ transcribe only those (CPU Whisper)
                                                             ▼
-                                       Claude picks and trims the best 2–2.5 min clips
+                                    the AI picks and trims the best 2–2.5 min clips
                                                             │
      download just those minutes of video ◄─────────────────┘
         │
@@ -21,7 +21,7 @@ VOD ──► download audio only ──► loudness "hype" curve ──► top 
  find facecam (OpenCV) ──► 1080×1920 layout ──► burn captions ──► post to #clips
                                                                       │
                                        Rater bot ◄────────────────────┘
-          frames + transcript + learned viral examples ──► Claude ──► 1–10 rating, fixes, caption
+          frames + transcript + learned viral examples ──► AI ──► 1–10 rating, fixes, caption
 ```
 
 * **CPU only.** Speech-to-text uses `faster-whisper` (int8 on CPU), face detection uses OpenCV, and video uses ffmpeg/x264. Only the hype moments get transcribed, so a 6-hour VOD doesn't need 6 hours of transcription.
@@ -31,7 +31,7 @@ VOD ──► download audio only ──► loudness "hype" curve ──► top 
   * `fit` layout (no facecam found): zoomed gameplay over a blurred background.
   * You can force any layout with `layout:` on `/clip`.
 * **Captions.** 1–3 words at a time, the current word highlighted in yellow, placed on the seam between cam and game.
-* **Clipping permission.** The bot reads the streamer's Twitch bio and panels, Kick bio, or YouTube channel description and looks for rules like *"no clipping"* or *"clips will be DMCA'd"* versus *"feel free to clip"* or *"clipping program"*. If the text is unclear, Claude reads it, but its answer is only used when it can quote the profile word for word. **Streamers marked `unknown` or `denied` are never clipped.** You approve them yourself with `/streamer permission`. Check their Discord rules and socials too, because many streamers only post clipping rules there.
+* **Clipping permission.** The bot reads the streamer's Twitch bio and panels, Kick bio, or YouTube channel description and looks for rules like *"no clipping"* or *"clips will be DMCA'd"* versus *"feel free to clip"* or *"clipping program"*. If the text is unclear, the AI reads it, but its answer is only used when it can quote the profile word for word. **Streamers marked `unknown` or `denied` are never clipped.** You approve them yourself with `/streamer permission`. Check their Discord rules and socials too, because many streamers only post clipping rules there.
 
 ## Discord commands
 
@@ -68,8 +68,16 @@ VOD ──► download audio only ──► loudness "hype" curve ──► top 
 3. For each bot: **OAuth2 → URL Generator**. Tick `bot` and `applications.commands`, and give it the permissions *Send Messages, Embed Links, Attach Files, Read Message History, Add Reactions*. Open the URL to invite the bot to your server.
 4. In Discord, enable Developer Mode, then right-click your server → *Copy Server ID*. That value is `DISCORD_GUILD_ID`.
 
-### 2. Get an Anthropic API key
-Create one at <https://console.anthropic.com/>. It powers clip selection, the permission check and the rater. Without a key the clipper still works using loudness + speech heuristics, but the rater won't.
+### 2. Choose the AI (free by default)
+The AI picks clip moments, reads unclear clipping rules, and powers the rater. Set it in `.env`:
+
+| `LLM_PROVIDER` | Cost | What you get |
+|---|---|---|
+| `ollama` *(default)* | **$0** | Free open models (Qwen 2.5 7B for text, Qwen 2.5-VL 7B for looking at frames) running on your Oracle server. They download automatically the first time (~10 GB total). Slower (each AI step can take a few minutes on CPU) and less accurate, especially the 1–10 ratings. |
+| `anthropic` | Paid per use | Claude: fast and much better judgement. Needs an API key from <https://console.anthropic.com/>. |
+| `none` | $0 | No AI. Clips are picked by loudness + amount of talking; the rater can't rate. |
+
+You can mix them: keep everything free but rate with Claude by setting `LLM_PROVIDER=ollama`, `RATER_LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY`.
 
 ### 3. Create the Oracle VM
 1. Oracle Cloud console → *Compute → Instances → Create*. Pick **Ubuntu 24.04**, shape **VM.Standard.A1.Flex** (Ampere ARM; *Always Free* covers up to 4 OCPU / 24 GB RAM), and a boot volume of 100 GB or more.
@@ -77,7 +85,7 @@ Create one at <https://console.anthropic.com/>. It powers clip selection, the pe
    ```bash
    git clone <this repo> stream-bot && cd stream-bot
    bash deploy/oracle-setup.sh
-   nano .env              # paste tokens, key, PUBLIC_BASE_URL=http://<VM public IP>:8080
+   nano .env              # paste Discord tokens, PUBLIC_BASE_URL=http://<VM public IP>:8080
    ```
 3. In *Networking → Virtual Cloud Networks → your VCN → Security Lists*, add an **Ingress rule: TCP 8080 from 0.0.0.0/0**. This lets the "Download full quality" links work.
 4. Log out and back in, then:
@@ -96,7 +104,7 @@ Instagram won't serve videos without a logged-in session. YouTube often blocks c
 
 * **Speed.** Everything runs on CPU. A long VOD takes a while: downloading audio, scanning it, transcribing ~12 moments, then rendering each clip with x264. Jobs run one at a time and post progress to Discord. To trade quality for speed, set `WHISPER_MODEL=base` and `RENDER_PRESET=superfast`.
 * **Discord's 10 MB upload limit.** A 2.5-minute 1080p clip is bigger than that, so Discord gets a smaller 540p preview and the full-quality file is served from the VM (`PUBLIC_BASE_URL`). Files are deleted after `CLIP_RETENTION_DAYS`.
-* **Claude costs.** Clip selection, permission checks, rating and learning all call `claude-opus-5-5` by default, roughly a few cents per clip rated or reference learned. `CLAUDE_MODEL=claude-sonnet-5-5` is about half the price. Requests opt into Anthropic's server-side refusal fallback, so a false-positive safety decline is retried on a fallback model instead of failing the job.
+* **AI costs.** The default free local AI costs nothing but shares the server's 4 CPU cores with transcription and rendering, so jobs take longer. If you switch to Claude: clip selection, permission checks, rating and learning call `claude-opus-5-5` by default, roughly a few cents per clip rated or reference learned. `CLAUDE_MODEL=claude-sonnet-5-5` is about half the price. Requests opt into Anthropic's server-side refusal fallback, so a false-positive safety decline is retried on a fallback model instead of failing the job.
 * **TikTok / Instagram scraping.** Collecting clipper posts and learning from viral clips uses yt-dlp. It can break when those sites change, and it's against their terms of service. Keep `yt-dlp` updated (`docker compose build --no-cache`).
 * **Permission check is best-effort.** It can only read what's in the public profile. You're still responsible for following each streamer's rules. That's why `unknown` never auto-clips.
 * **Posting to TikTok/Instagram/Facebook** is still manual. Download the clip, then use the rater's suggested caption and hashtags.
@@ -109,4 +117,4 @@ python -m pytest            # unit tests + ffmpeg render tests
 DATA_DIR=./data python -m clipper   # or: python -m rater
 ```
 
-Layout: `shared/` (config, SQLite, yt-dlp, Claude, whisper, permissions), `clipper/` (highlights, facecam, subtitles, render, pipeline, bot), `rater/` (learner, scorer, bot).
+Layout: `shared/` (config, SQLite, yt-dlp, AI providers, whisper, permissions), `clipper/` (highlights, facecam, subtitles, render, pipeline, bot), `rater/` (learner, scorer, bot).
