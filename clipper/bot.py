@@ -18,7 +18,7 @@ from shared.config import settings
 from shared.db import Database
 from shared.permissions import check_permission
 
-from . import fileserver, pipeline, posting
+from . import fileserver, pipeline, posting, selftest
 from .render import LAYOUTS
 
 log = logging.getLogger("clipper")
@@ -28,6 +28,9 @@ LAYOUT_CHOICES = [app_commands.Choice(name=n, value=n) for n in LAYOUTS]
 PERMISSION_COLORS = {"allowed": discord.Color.green(), "denied": discord.Color.red(),
                      "unknown": discord.Color.orange()}
 PLATFORM_LABELS = {"tiktok": "TikTok", "instagram": "Instagram", "facebook": "Facebook"}
+MAX_RETRIES = 2
+RETRY_MINUTES = 15
+BACKUPS_KEPT = 7
 
 
 def permission_embed(streamer: dict, sources: list[str] | None = None) -> discord.Embed:
@@ -149,6 +152,7 @@ class ClipperBot(discord.Client):
         self.clipper_watcher.start()
         self.cleanup.start()
         self.self_update.start()
+        self.backup_db.start()
 
     async def on_ready(self) -> None:
         log.info("Clipper bot ready as %s", self.user)
@@ -231,7 +235,15 @@ class ClipperBot(discord.Client):
             await self.set_job_status(job, f"✅ done in {took} — {len(clip_ids)} clip(s) posted.", force=True)
         except Exception as exc:  # noqa: BLE001
             log.error("Job %s failed: %s", job["id"], traceback.format_exc())
-            message = str(exc) if isinstance(exc, pipeline.JobError) else f"{type(exc).__name__}: {exc}"
+            message = pipeline.explain_error(exc)
+            attempts = (job.get("attempts") or 0) + 1
+            if pipeline.is_transient(exc) and attempts <= MAX_RETRIES:
+                delay = RETRY_MINUTES * attempts
+                self.db.update_job(job["id"], status="queued", attempts=attempts,
+                                   not_before=time.time() + delay * 60, error=message[:2000])
+                await self.set_job_status(job, f"⚠️ network problem, retrying in {delay} min "
+                                               f"(try {attempts}/{MAX_RETRIES}): {message[:300]}", force=True)
+                return
             self.db.update_job(job["id"], status="failed", error=message[:2000])
             if job["payload"].get("vod_row_id"):
                 self.db.execute("UPDATE vods SET status='failed' WHERE id=?", (job["payload"]["vod_row_id"],))
@@ -452,6 +464,15 @@ class ClipperBot(discord.Client):
             await asyncio.to_thread(pipeline.delete_clip_files, self.db, clip)
 
     @tasks.loop(hours=24)
+    async def backup_db(self) -> None:
+        """Daily copy of the database to data/backups (last 7 kept)."""
+        folder = settings.data_dir / "backups"
+        dest = folder / f"streambot-{time.strftime('%Y%m%d')}.sqlite3"
+        await asyncio.to_thread(self.db.backup, dest)
+        for old in sorted(folder.glob("streambot-*.sqlite3"))[:-BACKUPS_KEPT]:
+            old.unlink(missing_ok=True)
+
+    @tasks.loop(hours=24)
     async def self_update(self) -> None:
         """Restart (container entrypoint then updates yt-dlp) when a new yt-dlp is out and we're idle."""
         if self.self_update.current_loop == 0:
@@ -536,7 +557,41 @@ def register_commands(bot: ClipperBot) -> None:
         enabled = posting.enabled_platforms(db)
         embed.add_field(name="Auto-posting", inline=False,
                         value=", ".join(PLATFORM_LABELS[p] for p in enabled) or "not set up (optional)")
+        embed.add_field(name="Setup checklist", inline=False, value=setup_checklist(interaction.guild_id))
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    def setup_checklist(guild_id: int) -> str:
+        cfg = db.guild_config(guild_id)
+        allowed = db.one("SELECT COUNT(*) AS n FROM streamers WHERE guild_id=? AND permission='allowed'", (guild_id,))
+        unknown = db.one("SELECT COUNT(*) AS n FROM streamers WHERE guild_id=? AND permission='unknown'", (guild_id,))
+        items = [
+            (bool(cfg.get("clips_channel_id")), "Clips channel set (`/setup`)"),
+            (bool(cfg.get("log_channel_id")), "Log channel set (optional, keeps progress messages out of #clips)"),
+            (allowed["n"] > 0, f"{allowed['n']} streamer(s) allowed to clip"
+                               + (f" · {unknown['n']} waiting for your decision" if unknown["n"] else "")),
+            (bool(settings.public_base_url), "PUBLIC_BASE_URL set (full-quality download links)"),
+            (settings.llm_available() and settings.llm_available("rating"), "AI configured for clipping and rating"),
+        ]
+        return "\n".join(f"{'✅' if done else '⬜'} {text}" for done, text in items)
+
+    # ---------------- /selftest
+    @bot.tree.command(name="selftest", description="Make a test clip on the server to check every step works")
+    @admin
+    async def selftest_cmd(interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(
+            "🧪 Running the self-test: making a 20-second test stream, transcribing it, asking the AI, and "
+            "rendering a clip. The first run downloads the speech model, so it can take a few minutes…")
+        limit = (interaction.guild.filesize_limit if interaction.guild else 10 * 1024 * 1024) - 200_000
+        result = await selftest.run(limit)
+        embed = discord.Embed(title="Self-test " + ("passed ✅" if result.ok else "found problems ❌"),
+                              color=discord.Color.green() if result.ok else discord.Color.red())
+        for step in result.steps:
+            embed.add_field(name=f"{'✅' if step.ok else '❌'} {step.name} ({step.seconds:.0f}s)",
+                            value=step.detail[:1000] or "—", inline=False)
+        if not result.ok:
+            embed.set_footer(text="Paste the ❌ lines to whoever is helping you set this up.")
+        files = [discord.File(result.video, filename="selftest_clip.mp4")] if result.video else []
+        await interaction.followup.send(embed=embed, files=files)
 
     # ---------------- /connect
     @bot.tree.command(name="connect", description="Connect an account for auto-posting")

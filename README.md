@@ -39,6 +39,8 @@ VOD ──► download audio only ──► loudness "hype" curve ──┐
 * **Review in Discord.** Every clip gets buttons: ✅ **Approve**, 🗑️ **Discard** (deletes the files), ✂️ **Make shorter** (about 30% shorter, keeping the liveliest part), 🔄 **Change layout**. Re-edits reuse the saved source video, so nothing is downloaded again, and the new version is posted as a reply. Only admins can press the buttons.
 * **No duplicates.** A VOD that's already queued or clipped isn't clipped again; use `force:True` to override.
 * **Shares the CPU fairly.** Transcription, rendering and the local AI never run at the same time across the two bots, so neither slows the other down.
+* **Retries network failures.** A job that fails because of a network blip or a site timeout is retried automatically, up to 2 more times, 15 and 30 minutes later. Errors you need to fix yourself (subscriber-only VOD, YouTube asking for cookies, disk full) are explained in plain English instead.
+* **Daily backups.** The database (streamers, clips, ratings, view history) is copied to `data/backups/` every day, and the last 7 copies are kept.
 * **Keeps itself updated.** yt-dlp (the downloader) updates every time the bots start. Once a day, if a newer version is out and nothing is running, the bots restart themselves to pick it up.
 * **Clipping permission.** The bot reads the streamer's Twitch bio and panels, Kick bio, or YouTube channel description and looks for rules like *"no clipping"* or *"clips will be DMCA'd"* versus *"feel free to clip"* or *"clipping program"*. If the text is unclear, the AI reads it, but its answer is only used when it can quote the profile word for word. **Streamers marked `unknown` or `denied` are never clipped.** You approve them yourself with `/streamer permission`. Check their Discord rules and socials too, because many streamers only post clipping rules there.
 
@@ -49,6 +51,7 @@ VOD ──► download audio only ──► loudness "hype" curve ──┐
 | Command | |
 |---|---|
 | `/setup clips_channel [clipper_feed_channel] [log_channel]` | Where things get posted. Run this first. |
+| `/selftest` | Makes a 20-second test clip on the server with a synthetic voice and runs every step (speech-to-text, face detector, AI, cuts, captions, hook text, rendering), then posts the clip. **Run this right after deploying.** |
 | `/status` | Health check: can the server reach each site, is the AI running, disk space, job queue, recent errors. **Run this first if something isn't working.** |
 | `/streamer add platform channel [auto_clip]` | Track a streamer and run the clipping-permission check. New VODs are clipped automatically if allowed. |
 | `/streamer list` · `remove` · `recheck` · `autoclip` | Manage tracked streamers. |
@@ -106,7 +109,7 @@ You can mix them: keep everything free but rate with Claude by setting `LLM_PROV
    docker compose up -d --build
    docker compose logs -f
    ```
-5. In Discord: `/setup clips_channel:#clips clipper_feed_channel:#clipper-feed log_channel:#bot-log`, then `/streamer add`.
+5. In Discord: `/setup clips_channel:#clips clipper_feed_channel:#clipper-feed log_channel:#bot-log`, then `/selftest`, then `/streamer add`.
 
 Updating later: `git pull && docker compose up -d --build`.
 

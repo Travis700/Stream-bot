@@ -30,6 +30,46 @@ class JobError(RuntimeError):
     """An error worth showing to the Discord user as-is."""
 
 
+TRANSIENT_MARKERS = ("timed out", "timeout", "temporary failure", "temporarily", "connection reset",
+                     "connection refused", "connection aborted", "remote end closed", "incompleteread",
+                     "http error 5", "http error 429", "too many requests", "502", "503", "504",
+                     "unable to download webpage", "network is unreachable", "name resolution")
+
+FRIENDLY_ERRORS = [
+    ("sign in to confirm", "YouTube is blocking the server (\"confirm you're not a bot\"). Add a cookies file "
+                           "(README → Cookies) and try again."),
+    ("subscriber", "This VOD is subscriber-only, so the bot can't download it."),
+    ("private video", "This video is private."),
+    ("video unavailable", "This video is unavailable (deleted, region-locked or not finished processing)."),
+    ("has been removed", "This video has been removed."),
+    ("http error 403", "The site refused the download (HTTP 403). It may need a cookies file, or the VOD is "
+                       "restricted."),
+    ("unsupported url", "That link isn't a VOD the downloader recognises."),
+    ("no space left", "The server's disk is full. Discard old clips or lower CLIP_RETENTION_DAYS."),
+]
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Network-ish failures worth retrying later (not bad links or blocked content)."""
+    if isinstance(exc, JobError):
+        return False
+    text = f"{type(exc).__name__} {exc}".lower()
+    if any(marker in text for marker, _ in FRIENDLY_ERRORS):
+        return False
+    return any(marker in text for marker in TRANSIENT_MARKERS)
+
+
+def explain_error(exc: BaseException) -> str:
+    if isinstance(exc, JobError):
+        return str(exc)
+    text = str(exc)
+    lowered = text.lower()
+    for marker, friendly in FRIENDLY_ERRORS:
+        if marker in lowered:
+            return f"{friendly}\n-# {text[:300]}"
+    return f"{type(exc).__name__}: {text}"
+
+
 def vod_key(url: str) -> str:
     """Stable identity for a VOD, so different URL spellings of the same VOD match."""
     platform = platforms.detect_platform(url) or "other"

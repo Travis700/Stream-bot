@@ -161,6 +161,8 @@ MIGRATIONS = [
     ("clips", "options", "TEXT"),          # JSON render options (subtitles, tighten)
     ("clips", "parent_clip_id", "INTEGER"),
     ("streamers", "layout", "TEXT"),       # preferred layout for this streamer
+    ("jobs", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "not_before", "REAL"),        # retry time for jobs that hit a network error
 ]
 
 
@@ -249,7 +251,8 @@ class Database:
 
     def next_job(self) -> dict[str, Any] | None:
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
+            row = conn.execute("SELECT * FROM jobs WHERE status='queued' AND (not_before IS NULL OR not_before<=?) "
+                               "ORDER BY id LIMIT 1", (time.time(),)).fetchone()
             if not row:
                 return None
             conn.execute("UPDATE jobs SET status='running', updated_at=? WHERE id=?", (time.time(), row["id"]))
@@ -261,6 +264,16 @@ class Database:
         values["updated_at"] = time.time()
         cols = ", ".join(f"{k}=?" for k in values)
         self.execute(f"UPDATE jobs SET {cols} WHERE id=?", (*values.values(), job_id))
+
+    def backup(self, dest: Path) -> None:
+        """Consistent copy of the live database (safe while the bots are running)."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as src:
+            out = sqlite3.connect(dest)
+            try:
+                src.backup(out)
+            finally:
+                out.close()
 
     def requeue_interrupted_jobs(self) -> None:
         self.execute("UPDATE jobs SET status='queued', progress='restarted' WHERE status='running'")
