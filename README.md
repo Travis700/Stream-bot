@@ -81,16 +81,46 @@ VOD ──► download audio only ──► loudness "hype" curve ──┐
 | `/learn account url [min_views]` | Keep learning from an account's clips above `min_views`. |
 | `/learn accounts` · `forget` · `library` | |
 
-## Setup
+## Setup (about 20 minutes, no coding)
 
-### 1. Create the two Discord bots
-1. Go to <https://discord.com/developers/applications> and create an application named "Clipper". Under **Bot**, copy the token.
-2. Do it again for "Rater". On the Rater's **Bot** page, turn on **Message Content Intent**. It needs this to see videos in the clips channel.
-3. For each bot: **OAuth2 → URL Generator**. Tick `bot` and `applications.commands`, and give it the permissions *Send Messages, Embed Links, Attach Files, Read Message History, Add Reactions*. Open the URL to invite the bot to your server.
-4. In Discord, enable Developer Mode, then right-click your server → *Copy Server ID*. That value is `DISCORD_GUILD_ID`.
+The bot does nearly everything itself. You do three things that need your own accounts.
 
-### 2. Choose the AI (free by default)
-The AI picks clip moments, reads unclear clipping rules, and powers the rater. Set it in `.env`:
+### 1. Create the two Discord bots (5 min)
+1. Go to <https://discord.com/developers/applications> → **New Application** → name it "Clipper". Open **Bot** → **Reset Token** → copy the token somewhere safe.
+2. Do the same for "Rater". On the Rater's **Bot** page, also turn on **Message Content Intent**, so it can see the videos it rates.
+3. In Discord: *User Settings → Advanced →* turn on **Developer Mode**. Then right-click your server icon → **Copy Server ID**.
+
+You now have three values: two tokens and a server ID. You don't need to invite the bots yet; the installer gives you the invite links.
+
+### 2. Create the free Oracle server (10 min)
+Oracle Cloud console → *Compute → Instances → Create instance*:
+- **Image:** Ubuntu 24.04
+- **Shape:** VM.Standard.A1.Flex (Ampere), 4 OCPU / 24 GB RAM. This is covered by *Always Free*.
+- **Boot volume:** 100 GB or more
+
+Then pick **one** of these:
+
+**Option A, no terminal at all:** before clicking Create, open *Show advanced options → Management → Initialization script → Paste cloud-init script*. Paste the contents of [`deploy/oracle-cloud-init.sh`](deploy/oracle-cloud-init.sh) with your three values filled in at the top. The server installs everything by itself on first boot, which takes about 15 minutes.
+
+**Option B, one command:** create the server, connect with *Cloud Shell* or SSH, and run:
+```bash
+curl -fsSL https://raw.githubusercontent.com/Travis700/Stream-bot/claude/clip-and-rater-bots/deploy/install.sh | bash
+```
+It asks for your three values, then installs Docker, downloads the bots, writes the settings, opens the firewall and starts everything. At the end it prints the bot invite links.
+
+> **Private GitHub repo?** Both options need to download the code. Either make the repo public (*GitHub → repo Settings → Danger Zone → Change visibility*; no secrets are stored in it), or create a read-only token (*GitHub → Settings → Developer settings → Fine-grained tokens*, access to this repo, *Contents: Read-only*). For Option A, put the token in `GITHUB_TOKEN=""`. For Option B, run:
+> `export GITHUB_TOKEN=<token>; curl -fsSL -H "Authorization: token $GITHUB_TOKEN" https://raw.githubusercontent.com/Travis700/Stream-bot/claude/clip-and-rater-bots/deploy/install.sh | bash`
+
+### 3. Invite the bots and start (2 min)
+1. Open each invite link and pick your server. Option B prints the links. For Option A, the link is `https://discord.com/oauth2/authorize?client_id=<Application ID>&scope=bot%20applications.commands&permissions=117824`, where the Application ID is on each app's *General Information* page in the developer portal.
+2. In Discord: `/setup` (pick a clips channel and a log channel), then `/selftest`, then `/streamer add`. `/help` explains the rest.
+
+**Optional:** for the "Download full quality" buttons, add an Ingress rule for **TCP 8080** in the Oracle console (*Networking → Virtual Cloud Networks → your VCN → Security Lists*). Without it, you still get the preview video in Discord.
+
+**Updating later:** run the Option B command again. It keeps your settings.
+
+### The AI (free by default)
+The AI picks clip moments, reads unclear clipping rules, and powers the rater. Set it in `~/stream-bot/.env`:
 
 | `LLM_PROVIDER` | Cost | What you get |
 |---|---|---|
@@ -98,25 +128,7 @@ The AI picks clip moments, reads unclear clipping rules, and powers the rater. S
 | `anthropic` | Paid per use | Claude: fast and much better judgement. Needs an API key from <https://console.anthropic.com/>. |
 | `none` | $0 | No AI. Clips are picked by loudness + amount of talking; the rater can't rate. |
 
-You can mix them: keep everything free but rate with Claude by setting `LLM_PROVIDER=ollama`, `RATER_LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY`.
-
-### 3. Create the Oracle VM
-1. Oracle Cloud console → *Compute → Instances → Create*. Pick **Ubuntu 24.04**, shape **VM.Standard.A1.Flex** (Ampere ARM; *Always Free* covers up to 4 OCPU / 24 GB RAM), and a boot volume of 100 GB or more.
-2. SSH in and run:
-   ```bash
-   git clone <this repo> stream-bot && cd stream-bot
-   bash deploy/oracle-setup.sh
-   nano .env              # paste Discord tokens, PUBLIC_BASE_URL=http://<VM public IP>:8080
-   ```
-3. In *Networking → Virtual Cloud Networks → your VCN → Security Lists*, add an **Ingress rule: TCP 8080 from 0.0.0.0/0**. This lets the "Download full quality" links work.
-4. Log out and back in, then:
-   ```bash
-   docker compose up -d --build
-   docker compose logs -f
-   ```
-5. In Discord: `/setup clips_channel:#clips clipper_feed_channel:#clipper-feed log_channel:#bot-log`, then `/selftest`, then `/streamer add`.
-
-Updating later: `git pull && docker compose up -d --build`.
+You can mix them: keep everything free but rate with Claude by setting `LLM_PROVIDER=ollama`, `RATER_LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY`. After editing `.env`, run `cd ~/stream-bot && sudo docker compose up -d`.
 
 ### Auto-posting (optional)
 After you approve a clip, buttons appear to post it straight to each platform you've set up. Each one needs a developer app from that platform, so this is the most setup-heavy part. Skip it if you're happy downloading and posting by hand.
